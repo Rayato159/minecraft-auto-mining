@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/philshiu/Drosophila_brain_model",
+  "revision": "91bdd1e7dcf193f3e7ca5a8933497fcef63b7960",
+  "checksum_note": "SHA-256; CSV is normalized to UTF-8 LF to accept Windows Git checkouts. Parquet is hashed as raw bytes.",
+  "files": [
+    {
+      "name": "Completeness_783.csv",
+      "sha256": "BBB847A4CC2CAAA7A16349722D220C087317B946D148D4D592D94D250617A311"
+    },
+    {
+      "name": "Connectivity_783.parquet",
+      "sha256": "EFEB23FB99098E9C390F6869969B2A121A2EE92C833CFC45ECB2C1D8E1AF0347"
+    }
+  ]
+}

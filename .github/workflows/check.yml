@@ -1,0 +1,33 @@
+name: Workbench checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy
+      - name: Format
+        run: cargo +1.95.0 fmt --all -- --check
+      - name: Test
+        run: cargo +1.95.0 test --locked
+      - name: Clippy
+        run: cargo +1.95.0 clippy --locked --all-targets -- -D warnings
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build bridge and run Java checks
+        working-directory: forge-bridge
+        run: bash gradlew build --no-daemon --console=plain

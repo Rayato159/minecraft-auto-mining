@@ -1,0 +1,57 @@
+# Personal configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Learned weights, terrain, command logs, inventories and local backups
+/runtime/
+
+# Upstream research checkout and large connectome data; fetch separately
+/references/
+*.parquet
+*.pickle
+
+# Rust and Forge build outputs (keep Cargo.lock and Gradle wrapper sources)
+/target/
+/.gradle-home/
+/forge-bridge/.gradle/
+/forge-bridge/build/
+/forge-bridge/bin/
+/forge-bridge/run/
+/forge-bridge/run-data/
+/forge-bridge/logs/
+/forge-bridge/mcmodsrepo/
+*.class
+*.jar
+!forge-bridge/gradle/wrapper/gradle-wrapper.jar
+*.exe
+*.dll
+*.pdb
+*.so
+*.dylib
+
+# Scratch work, downloaded validation environments and packages
+/tmp/
+*.tmp
+*.pending
+*.download
+*.log
+*.zip
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editor / operating system files
+.idea/
+.vscode/
+*.iml
+.classpath
+.project
+.settings/
+.DS_Store
+Thumbs.db
+Desktop.ini
