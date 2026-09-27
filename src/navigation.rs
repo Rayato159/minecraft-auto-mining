@@ -2,6 +2,7 @@
 use crate::{
     bridge::atomic_json,
     safety::{LIQUID_RADIUS, LiquidMask},
+    terrain::Cells,
     types::{Block, Home, Pos, State},
     world::{World, clearance},
 };
@@ -17,7 +18,7 @@ use std::{
 
 #[derive(Default)]
 pub struct Atlas {
-    cells: HashMap<Pos, usize>,
+    cells: Cells,
     palette: Vec<Block>,
     ids: HashMap<String, usize>,
     session: String,
@@ -27,7 +28,14 @@ struct Saved {
     version: u32,
     session: String,
     palette: Vec<Block>,
-    cells: Vec<(Pos, usize)>,
+    cells: Cells,
+}
+#[derive(Serialize)]
+struct SavedView<'a> {
+    version: u32,
+    session: &'a str,
+    palette: &'a [Block],
+    cells: &'a Cells,
 }
 impl Atlas {
     fn path(runtime: &Path, session: &str) -> PathBuf {
@@ -46,8 +54,11 @@ impl Atlas {
         if !path.exists() {
             return Ok(out);
         }
-        let saved: Saved =
-            serde_json::from_slice(&fs::read(&path)?).context("Read saved terrain")?;
+        let saved: Saved = serde_json::from_reader(std::io::BufReader::with_capacity(
+            256 * 1024,
+            fs::File::open(&path)?,
+        ))
+        .with_context(|| format!("Read saved terrain {}", path.display()))?;
         if saved.version == 1 {
             // Old scans treated doors/stair tops as solid walls. Preserve the
             // old file, then rescan geometry instead of guessing from block IDs.
@@ -57,32 +68,58 @@ impl Atlas {
             }
             return Ok(out);
         }
-        if saved.version != 2
-            || saved.session != session
-            || saved.cells.len() > 2_000_000
-            || saved.cells.iter().any(|(_, i)| *i >= saved.palette.len())
-            || saved
-                .palette
-                .iter()
-                .any(|b| !b.seconds.is_finite() || b.seconds < 0.)
+        if saved.version != 2 {
+            bail!(
+                "Unsupported terrain version {} in {}",
+                saved.version,
+                path.display()
+            );
+        }
+        if saved.session != session {
+            bail!(
+                "Saved terrain belongs to a different world/player/dimension: {}",
+                path.display()
+            );
+        }
+        if saved.palette.len() >= u32::MAX as usize {
+            bail!(
+                "Terrain palette exceeds its index range: {}",
+                path.display()
+            );
+        }
+        if let Some((p, i)) = saved.cells.iter().find(|(_, i)| *i >= saved.palette.len()) {
+            bail!(
+                "Invalid terrain palette index {i} at {p:?} in {}",
+                path.display()
+            );
+        }
+        if saved
+            .palette
+            .iter()
+            .any(|b| !b.seconds.is_finite() || b.seconds < 0.)
         {
-            bail!("Invalid saved terrain; move its terrain-*.json file aside before retrying");
+            bail!("Invalid terrain movement/mining cost in {}", path.display());
         }
         out.palette = saved.palette;
         for (i, b) in out.palette.iter().enumerate() {
             out.ids.insert(serde_json::to_string(b)?, i);
         }
-        out.cells = saved.cells.into_iter().collect();
+        out.cells = saved.cells;
+        println!(
+            "Terrain: {} remembered blocks; {:.1} MiB of section indices",
+            out.cells.len(),
+            out.cells.storage_bytes() as f64 / (1024. * 1024.)
+        );
         Ok(out)
     }
     pub fn save(&self, runtime: &Path) -> Result<()> {
         atomic_json(
             &Self::path(runtime, &self.session),
-            &Saved {
+            &SavedView {
                 version: 2,
-                session: self.session.clone(),
-                palette: self.palette.clone(),
-                cells: self.cells.iter().map(|(p, i)| (*p, *i)).collect(),
+                session: &self.session,
+                palette: &self.palette,
+                cells: &self.cells,
             },
         )
     }
@@ -93,14 +130,11 @@ impl Atlas {
         }
         for (i, id) in world.scan.cells.iter().enumerate() {
             if world.scan.palette[*id].block != "unknown" {
-                self.cells.insert(world.pos(i), indices[*id]);
+                self.cells.insert(world.pos(i), indices[*id] as u32);
             }
         }
         for (p, b) in &world.patches {
             self.put(*p, b)?;
-        }
-        if self.cells.len() > 2_000_000 {
-            bail!("Terrain memory limit reached; stopped before discarding the return map");
         }
         Ok(())
     }
@@ -110,19 +144,22 @@ impl Atlas {
             return Ok(*i);
         }
         let i = self.palette.len();
+        if i >= u32::MAX as usize {
+            bail!("Terrain palette exceeds its index range");
+        }
         self.palette.push(b.clone());
         self.ids.insert(key, i);
         Ok(i)
     }
     pub fn put(&mut self, p: Pos, b: &Block) -> Result<()> {
         let id = self.intern(b)?;
-        self.cells.insert(p, id);
+        self.cells.insert(p, id as u32);
         Ok(())
     }
     fn get<'a>(&'a self, world: &'a World, p: Pos) -> Option<&'a Block> {
         world
             .get(p)
-            .or_else(|| self.cells.get(&p).and_then(|i| self.palette.get(*i)))
+            .or_else(|| self.cells.get(&p).and_then(|i| self.palette.get(i)))
     }
     pub fn route(
         &self,
@@ -154,7 +191,7 @@ impl Atlas {
         visits: &HashMap<Pos, u32>,
         budget: Option<Duration>,
     ) -> Option<TripPath> {
-        let start = state.position.cell();
+        let start = state.feet();
         if goals.is_empty() {
             return None;
         }
@@ -245,10 +282,11 @@ impl Atlas {
                     let to = p.offset(dx, dy, dz);
                     if blocked.contains(&to)
                         || clearance(p, to).iter().any(|q| blocked.contains(q))
-                        || state
-                            .hostiles
-                            .iter()
-                            .any(|e| e.visible && to.distance(e.position.cell()) < 4.)
+                        || state.hostiles.iter().any(|e| {
+                            e.visible
+                                && to.distance(e.position.cell())
+                                    < crate::nether::threat_radius(state, e)
+                        })
                     {
                         continue;
                     }
@@ -312,10 +350,10 @@ pub fn benchmark(runtime: &Path, instance: &Path) -> Result<()> {
     let origin = start.offset(-16, -16, -16);
     let cells = (0..33 * 33 * 33)
         .map(|i| {
-            *atlas
+            atlas
                 .cells
                 .get(&origin.offset(i % 33, i / (33 * 33), (i / 33) % 33))
-                .unwrap_or(&unknown)
+                .unwrap_or(unknown)
         })
         .collect();
     let world = World::new(
@@ -363,7 +401,7 @@ pub fn benchmark(runtime: &Path, instance: &Path) -> Result<()> {
 }
 /// Batch only straight, level, freshly checked walking cells. No digging or blind corners.
 pub fn walking_batch(world: &World, state: &State, path: &[Pos]) -> Vec<Pos> {
-    let mut from = state.position.cell();
+    let mut from = state.feet();
     let Some(first) = path.first() else {
         return Vec::new();
     };
@@ -503,6 +541,8 @@ pub fn return_reason(state: &State) -> Option<&'static str> {
         Some("Pickaxes exhausted")
     } else if !state.has("food") {
         Some("Food exhausted")
+    } else if crate::nether::active(state) && !state.has("torch") {
+        Some("Nether trail torches exhausted")
     } else if state.target_harvestable == Some(false) {
         Some("Need a pickaxe suitable for the selected ore")
     } else if !state.reserve_pickaxe() {
@@ -546,8 +586,8 @@ mod tests {
             z: 16.5,
         };
         let mut world = World::new(scan, &state).expect("shaft");
-        world.clear(state.position.cell());
-        world.clear(state.position.cell().offset(0, 1, 0));
+        world.clear(state.feet());
+        world.clear(state.feet().offset(0, 1, 0));
         let mut atlas = Atlas::default();
         atlas.ingest(&world).expect("atlas");
         let route = atlas
@@ -567,7 +607,7 @@ mod tests {
             .expect("A supported staircase frontier must be returned before unknown jump headroom");
         assert!(!route.complete);
         assert_eq!(route.path.last().expect("end").y, 28);
-        let mut from = state.position.cell();
+        let mut from = state.feet();
         for to in route.path {
             assert!(travel_cost(&|p| world.get(p), &state.home, from, to, true).is_some());
             from = to;
@@ -591,8 +631,8 @@ mod tests {
             z: 16.5,
         };
         let mut world = World::new(scan, &state).expect("world");
-        world.clear(state.position.cell());
-        world.clear(state.position.cell().offset(0, 1, 0));
+        world.clear(state.feet());
+        world.clear(state.feet().offset(0, 1, 0));
         let mut atlas = Atlas::default();
         atlas.ingest(&world).expect("atlas");
         let goal = Pos {
@@ -613,10 +653,8 @@ mod tests {
             .expect("A time slice ending before the scan edge is not proof of no route");
         assert!(!route.complete);
         assert_eq!(route.end, RouteEnd::SearchBudget);
-        assert!(
-            route.path.last().expect("end").distance(goal) < state.position.cell().distance(goal)
-        );
-        let mut from = state.position.cell();
+        assert!(route.path.last().expect("end").distance(goal) < state.feet().distance(goal));
+        let mut from = state.feet();
         for to in route.path {
             assert!(travel_cost(&|p| world.get(p), &state.home, from, to, true).is_some());
             from = to;
@@ -691,7 +729,7 @@ mod tests {
     #[test]
     fn protected_hand_operated_door_is_opened_not_dug_or_batched() {
         let (mut w, mut s) = fixture();
-        let from = s.position.cell();
+        let from = s.feet();
         let to = from.offset(1, 0, 0);
         s.home.home = Some(to);
         s.home.radius = 10;
@@ -745,11 +783,11 @@ mod tests {
         assert!(s.home.protected(Pos { x: 4, y: -60, z: 3 }));
         assert!(!w.can_clear(Pos { x: 4, y: 1, z: 3 }));
         let to = Pos { x: 4, y: 1, z: 3 };
-        assert!(travel_cost(&|p| w.get(p), &s.home, s.position.cell(), to, true).is_none());
+        assert!(travel_cost(&|p| w.get(p), &s.home, s.feet(), to, true).is_none());
         for y in [1, 2] {
             w.clear(Pos { x: 4, y, z: 3 });
         }
-        assert!(travel_cost(&|p| w.get(p), &s.home, s.position.cell(), to, false).is_some());
+        assert!(travel_cost(&|p| w.get(p), &s.home, s.feet(), to, false).is_some());
     }
     #[test]
     fn a_star_finds_shortest_known_route_and_refuses_digs_without_tool() {
@@ -777,9 +815,124 @@ mod tests {
         atlas.ingest(&w).expect("ingest");
         atlas.save(&root).expect("save");
         assert!(!Atlas::load(&root, &s).expect("restore").cells.is_empty());
+        s.mining_profile.name = "dwarf".into();
+        assert!(
+            Atlas::load(&root, &s).expect("dwarf").cells.is_empty(),
+            "Dwarf routes must not reuse terrain scanned without sky-exposure checks"
+        );
+        s.mining_profile.name = "standard".into();
         s.dimension = "another".into();
         assert!(Atlas::load(&root, &s).expect("other").cells.is_empty());
         fs::remove_dir_all(root).expect("clean");
+    }
+    #[test]
+    fn dwarf_exposure_and_roof_cuts_are_rejected_by_travel_and_mining() {
+        let (mut w, s) = fixture();
+        let to = Pos { x: 4, y: 1, z: 3 };
+        assert!(travel_cost(&|p| w.get(p), &s.home, s.feet(), to, true).is_some());
+        let mut roof = w.get(to).expect("terrain").clone();
+        roof.diggable = false;
+        w.patches.insert(to, roof);
+        assert!(travel_cost(&|p| w.get(p), &s.home, s.feet(), to, true).is_none());
+        assert!(!w.can_clear(to));
+        w.clear(to);
+        w.clear(to.offset(0, 1, 0));
+        assert!(travel_cost(&|p| w.get(p), &s.home, s.feet(), to, true).is_some());
+        w.patches.get_mut(&to).expect("air").danger = true;
+        assert!(travel_cost(&|p| w.get(p), &s.home, s.feet(), to, true).is_none());
+        assert!(!w.can_clear(to));
+    }
+    #[test]
+    fn terrain_crosses_old_two_million_limit_and_reloads_without_losing_cells() {
+        let (mut world, state) = fixture();
+        let root = std::env::temp_dir().join(format!("miner-large-atlas-{}", crate::bridge::now()));
+        fs::create_dir_all(&root).expect("dir");
+        let mut atlas = Atlas::load(&root, &state).expect("empty");
+        let id = atlas.intern(&world.scan.palette[0]).expect("palette") as u32;
+        for i in 0..2_000_000 {
+            atlas.cells.insert(
+                Pos {
+                    x: i % 128,
+                    y: i / (128 * 128),
+                    z: (i / 128) % 128,
+                },
+                id,
+            );
+        }
+        world.scan.origin = Pos {
+            x: 1000,
+            y: 1000,
+            z: 1000,
+        };
+        atlas
+            .ingest(&world)
+            .expect("scan across the old limit must succeed");
+        let count = atlas.cells.len();
+        assert!(count > 2_000_000);
+        assert!(
+            atlas.cells.storage_bytes() < count * 8,
+            "dense section indices must avoid per-cell hash overhead"
+        );
+        atlas.save(&root).expect("save oversized v2 map");
+        let loaded = Atlas::load(&root, &state).expect("reload own checkpoint");
+        assert_eq!(loaded.cells.len(), count);
+        for p in [
+            Pos::default(),
+            Pos {
+                x: 127,
+                y: 100,
+                z: 127,
+            },
+            world.scan.origin,
+        ] {
+            assert_eq!(loaded.cells.get(&p), atlas.cells.get(&p));
+            assert!(loaded.cells.get(&p).is_some());
+        }
+        assert!(
+            loaded
+                .cells
+                .get(&Pos {
+                    x: 500,
+                    y: 500,
+                    z: 500
+                })
+                .is_none(),
+            "unexplored gap stays unknown"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn terrain_still_rejects_invalid_indices_costs_sessions_and_versions() {
+        let (world, state) = fixture();
+        let root =
+            std::env::temp_dir().join(format!("miner-invalid-atlas-{}", crate::bridge::now()));
+        fs::create_dir_all(&root).expect("dir");
+        let base = serde_json::json!({"version":2,"session":state.session_key(),"palette":[world.scan.palette[0]],"cells":[[Pos::default(),0]]});
+        let path = Atlas::path(&root, &state.session_key());
+        for (field, value, expected) in [
+            ("/cells/0/1", serde_json::json!(1), "palette index"),
+            ("/palette/0/seconds", serde_json::json!(-1.), "cost"),
+            (
+                "/session",
+                serde_json::json!("another-world"),
+                "different world",
+            ),
+            ("/version", serde_json::json!(999), "version"),
+        ] {
+            let mut invalid = base.clone();
+            *invalid.pointer_mut(field).expect("field") = value;
+            atomic_json(&path, &invalid).expect("write fixture");
+            let error = Atlas::load(&root, &state)
+                .err()
+                .expect("reject corrupt metadata");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&fs::read(&path).expect("preserved"))
+                    .expect("json"),
+                invalid
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -870,8 +1023,8 @@ mod tests {
             travel_cost(
                 &|p| world.get(p),
                 &state.home,
-                state.position.cell(),
-                state.position.cell().offset(0, 1, 0),
+                state.feet(),
+                state.feet().offset(0, 1, 0),
                 true
             )
             .is_none()

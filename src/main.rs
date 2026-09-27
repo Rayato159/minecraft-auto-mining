@@ -2,9 +2,12 @@ mod bandit;
 mod brain;
 mod bridge;
 mod controller;
+mod lighting;
 mod navigation;
+mod nether;
 mod planner;
 mod safety;
+mod terrain;
 mod types;
 mod world;
 use anyhow::{Context, Result, bail};
@@ -44,7 +47,10 @@ fn main() -> Result<()> {
     }
     if matches!(verb.as_str(), "help" | "--help" | "-h") {
         println!(
-            "Rust Mining Controller 0.7.1\n\nminer run       Continuous mining / survival / home storage and restocking\nminer craft     Craft the best available pickaxe only\nminer brain-bench  Benchmark real FlyWire graph, SIMD vs scalar\nminer brain-trace  Export independent LIF validation fixture\nminer status    Current game status\nminer scan      Scan and preview best target without moving or mining\nminer stop      Stop a running controller\n\nOptions: --instance <folder> --max-actions <N> --max-seconds <N> --no-brain (baseline comparison)\nIn game: /flyminer enable | stop | target <ore-id> (Tab for suggestions) | home [set X Y Z | radius N | search N | status | clear] | mine set [X Y Z]"
+            "Rust Mining Controller 0.11.0\n\nminer run       Mine continuously, returning home for supplies when needed\nminer craft     Craft the best available pickaxe only\nminer brain-bench  Benchmark real FlyWire graph, SIMD vs scalar\nminer brain-trace  Export independent LIF validation fixture\nminer status    Current game status\nminer scan      Scan and preview best target without moving or mining\nminer stop      Stop a running controller\n\nOptions: --instance <folder> --max-actions <N> --max-seconds <N> --no-brain (baseline comparison)\nIn game: /flyminer enable | stop | target <ore-id> (Tab for suggestions) | home [set X Y Z | radius N | search N | status | clear] | mine set [X Y Z]"
+        );
+        println!(
+            "\nminer mine      Cancel an unfinished trip and mine at the current position\nminer mine --waypoint  Cancel the old trip, travel to the saved mine, then mine\n\nrun resumes unfinished home trips; stop pauses them. mine keeps home protection and automatic supply returns."
         );
         return Ok(());
     }
@@ -52,8 +58,10 @@ fn main() -> Result<()> {
     let mut max_actions = None;
     let mut max_seconds = None;
     let mut brain_enabled = true;
+    let mut waypoint = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--waypoint" if verb == "mine" => waypoint = true,
             "--no-brain" => brain_enabled = false,
             "--instance" => {
                 location = Some(PathBuf::from(args.next().context("Missing instance path")?))
@@ -82,7 +90,15 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&bridge.state()?)?);
             Ok(())
         }
-        "run" => controller::run(&mut bridge),
+        "run" => controller::run(&mut bridge, controller::StartMode::Resume),
+        "mine" => controller::run(
+            &mut bridge,
+            if waypoint {
+                controller::StartMode::MineWaypoint
+            } else {
+                controller::StartMode::MineHere
+            },
+        ),
         "craft" => {
             let _lock = bridge.lock()?;
             if bridge.runtime.join("stop-request.json").exists() {

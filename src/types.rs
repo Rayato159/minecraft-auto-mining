@@ -41,6 +41,7 @@ impl Point {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Block {
+    pub water: bool,
     pub block: String,
     pub clear: bool,
     pub openable: bool,
@@ -101,6 +102,7 @@ pub struct Route {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Navigation {
+    pub feet: Option<Pos>,
     pub routes: Vec<Route>,
     pub ores: Vec<LocalBlock>,
     pub source_floor: Option<LocalBlock>,
@@ -124,6 +126,8 @@ pub struct Stack {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Enemy {
+    pub ranged: bool,
+    pub avoid_only: bool,
     pub id: i32,
     pub uuid: String,
     #[serde(rename = "type")]
@@ -161,7 +165,26 @@ pub struct Crafting {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct Oxygen {
+    pub known: bool,
+    pub quality: String,
+    pub breathable: bool,
+    pub air: i32,
+    pub max_air: i32,
+    pub tank_air: f64,
+    pub tank_capacity: f64,
+    pub diving_gear: bool,
+    pub submerged: bool,
+    pub needs_escape: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct State {
+    pub mining_profile: MiningProfile,
+    pub oxygen: Oxygen,
+    pub on_fire: bool,
+    pub fire_resistant: bool,
+    pub capabilities: Vec<String>,
     pub liquid_safe: Option<bool>,
     pub crafting: Crafting,
     pub updated_at: u64,
@@ -194,6 +217,22 @@ pub struct State {
     pub container_owned: bool,
 }
 impl State {
+    /// Route-space cell supplied by the bridge; soul sand has a 7/8-block surface.
+    /// Keep the physical position intact for distance/oxygen telemetry.
+    pub fn feet(&self) -> Pos {
+        let raw = self.position.cell();
+        self.navigation
+            .feet
+            .filter(|p| {
+                p.x == raw.x
+                    && p.z == raw.z
+                    && (p.y == raw.y
+                        || self.on_ground
+                            && p.y == raw.y + 1
+                            && (f64::from(p.y) - self.position.y).abs() <= 0.15)
+            })
+            .unwrap_or(raw)
+    }
     pub fn reserve_pickaxe(&self) -> bool {
         self.inventory.iter().any(|s| {
             s.count > 0
@@ -225,16 +264,33 @@ impl State {
         })
     }
     pub fn goal_key(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.server,
-            self.username,
-            self.dimension,
-            family(&self.mining_target)
-        )
+        format!("{}|{}", self.session_key(), family(&self.mining_target))
     }
     pub fn session_key(&self) -> String {
-        format!("{}|{}|{}", self.server, self.username, self.dimension)
+        let base = format!("{}|{}|{}", self.server, self.username, self.dimension);
+        if self.mining_profile.name == "dwarf" {
+            format!("{base}|dwarf-v1")
+        } else {
+            base
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MiningProfile {
+    pub name: String,
+    pub can_swim: bool,
+    pub requires_cover: bool,
+    pub under_cover: bool,
+}
+impl Default for MiningProfile {
+    fn default() -> Self {
+        Self {
+            name: "standard".into(),
+            can_swim: true,
+            requires_cover: false,
+            under_cover: true,
+        }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +312,7 @@ pub struct Scan {
 pub fn family(id: &str) -> String {
     id.replace("minecraft:deepslate_", "minecraft:")
 }
+
 pub fn matches(block: &str, goal: &str) -> bool {
     goal.is_empty() || family(block) == family(goal)
 }
@@ -279,4 +336,55 @@ pub fn points(block: &str, goal: &str) -> f64 {
     .iter()
     .find_map(|(name, p)| block.contains(name).then_some(*p))
     .unwrap_or(4.)
+}
+
+#[cfg(test)]
+mod standing_tests {
+    use super::*;
+    #[test]
+    fn old_state_defaults_to_standard_and_dwarf_learning_is_separate() {
+        let mut s: State = serde_json::from_str(r#"{"server":"world","username":"player","dimension":"minecraft:overworld","miningTarget":"minecraft:iron_ore"}"#).expect("old state");
+        assert!(s.mining_profile.can_swim && s.mining_profile.under_cover);
+        assert!(!s.mining_profile.requires_cover);
+        assert_eq!(
+            s.goal_key(),
+            "world|player|minecraft:overworld|minecraft:iron_ore"
+        );
+        let old = s.goal_key();
+        s.mining_profile.name = "dwarf".into();
+        assert_ne!(old, s.goal_key());
+        assert!(s.session_key().ends_with("|dwarf-v1"));
+    }
+    #[test]
+    fn standing_cell_requires_nearby_grounded_bridge_geometry() {
+        let mut s = State {
+            position: Point {
+                x: 67.5,
+                y: 111.875,
+                z: -5.45,
+            },
+            on_ground: true,
+            ..State::default()
+        };
+        let top = Pos {
+            x: 67,
+            y: 112,
+            z: -6,
+        };
+        assert_eq!(s.feet().y, 111, "old bridge remains physical");
+        s.navigation.feet = Some(top);
+        assert_eq!(s.feet(), top);
+        s.on_ground = false;
+        assert_eq!(s.feet().y, 111, "airborne positions are never rounded up");
+        s.on_ground = true;
+        s.position.y = 111.5;
+        assert_eq!(s.feet().y, 111, "half slabs are not silently supported");
+        s.position.y = 111.875;
+        s.navigation.feet = Some(top.offset(1, 0, 0));
+        assert_eq!(
+            s.feet().x,
+            67,
+            "stale/foreign cell cannot redirect navigation"
+        );
+    }
 }

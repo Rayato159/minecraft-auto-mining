@@ -21,10 +21,9 @@ pub struct Plan {
     pub brain_features: Option<crate::brain::Features>,
 }
 fn blocked_by_enemy(p: Pos, state: &State) -> bool {
-    state
-        .hostiles
-        .iter()
-        .any(|e| e.visible && p.distance(e.position.cell()) < 4.)
+    state.hostiles.iter().any(|e| {
+        e.visible && p.distance(e.position.cell()) < crate::nether::threat_radius(state, e)
+    })
 }
 fn vein_neighbors(p: Pos) -> impl Iterator<Item = Pos> {
     (-1..=1).flat_map(move |dy| {
@@ -75,6 +74,9 @@ impl VeinFocus {
     pub fn contains(&self, p: Pos) -> bool {
         self.members.contains(&p)
     }
+    pub fn pending(&self) -> impl Iterator<Item = Pos> + '_ {
+        self.pending.iter().copied()
+    }
     pub fn remaining(&self, world: &World, goal: &str) -> usize {
         self.pending
             .iter()
@@ -114,7 +116,7 @@ pub fn candidates_for(
     visits: &HashMap<Pos, u32>,
     focus: Option<&VeinFocus>,
 ) -> Vec<Plan> {
-    let start = state.position.cell();
+    let start = state.feet();
     let Some(root) = world.index(start) else {
         return Vec::new();
     };
@@ -201,6 +203,12 @@ pub fn candidates_for(
             for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 for dy in [-1, 0] {
                     let stand = p.offset(dx, dy, dz);
+                    if blocked.contains(&stand)
+                        || crate::nether::active(state)
+                            && !crate::nether::covered(&|q| world.get(q), stand)
+                    {
+                        continue;
+                    }
                     let Some(j) = world.index(stand) else {
                         continue;
                     };
@@ -248,13 +256,31 @@ pub fn candidates_for(
             .min()
             .unwrap_or(start.y);
         let descent_y = lowest.max(start.y - 6);
+        let nether_y = crate::nether::exploration_y(state);
+        let best_height_gap = nether_y.map(|goal| {
+            distance
+                .iter()
+                .enumerate()
+                .filter(|(j, cost)| {
+                    **cost != u64::MAX
+                        && !blocked.contains(&world.pos(*j))
+                        && visits.get(&world.pos(*j)).copied().unwrap_or(0) <= 3
+                        && (world.pos(*j).y - start.y).abs() <= 6
+                        && start.distance(world.pos(*j)) >= 3.
+                })
+                .map(|(j, _)| (world.pos(j).y - goal).abs())
+                .min()
+                .unwrap_or((start.y - goal).abs())
+        });
         for (j, cost) in distance.iter().enumerate() {
             if *cost == u64::MAX {
                 continue;
             }
             let p = world.pos(j);
             if blocked.contains(&p)
-                || if lowest < start.y {
+                || if let (Some(goal), Some(gap)) = (nether_y, best_height_gap) {
+                    (p.y - goal).abs() != gap || (p.y - start.y).abs() > 6 || start.distance(p) < 3.
+                } else if lowest < start.y {
                     p.y > descent_y
                 } else {
                     p.y != start.y || start.distance(p) < 6.
@@ -269,6 +295,26 @@ pub fn candidates_for(
             candidates.push(make_plan(
                 world, state, &parent, root, j, p, *cost, 0, 0., visits, model,
             ));
+        }
+        // A dry ascent/short detour can be the only exit from a bowl or a
+        // liquid-blocked descent. All edges still obey the same one-level,
+        // supported-floor and two-block fluid checks as normal mining.
+        if candidates.is_empty() {
+            for (j, cost) in distance.iter().enumerate() {
+                let p = world.pos(j);
+                if *cost == u64::MAX
+                    || p == start
+                    || blocked.contains(&p)
+                    || start.distance(p) < 2.
+                    || p.y > start.y + 6
+                    || visits.get(&p).copied().unwrap_or(0) > 3
+                {
+                    continue;
+                }
+                candidates.push(make_plan(
+                    world, state, &parent, root, j, p, *cost, 0, 0., visits, model,
+                ));
+            }
         }
     }
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -302,7 +348,7 @@ fn make_plan(
     path.reverse();
     let seconds = cost as f64 / 1000.;
     let stand = world.pos(index);
-    let mut previous = state.position.cell();
+    let mut previous = state.feet();
     let mut digs: f64 = 0.;
     for p in &path {
         for cell in clearance(previous, *p) {
@@ -328,7 +374,7 @@ fn make_plan(
         (vein as f64 / 10.).min(1.),
         (seconds / 60.).min(1.),
         (digs / 30.).min(1.),
-        f64::from((stand.y - state.position.cell().y).abs()) / 16.,
+        f64::from((stand.y - state.feet().y).abs()) / 16.,
         state.health / 20.,
         state.food as f64 / 20.,
         durability,
@@ -424,7 +470,7 @@ pub mod tests {
     #[test]
     fn stairs_and_hazards_have_real_constraints() {
         let (mut world, state) = fixture();
-        let start = state.position.cell();
+        let start = state.feet();
         assert!(world.cost(start, start.offset(1, 1, 0)).is_some());
         let down = start.offset(1, -1, 0);
         world.clear(down.offset(0, -1, 0));
@@ -441,6 +487,117 @@ pub mod tests {
         );
         assert!(world.cost(start, landing).is_none());
         assert!(!world.can_clear(landing));
+    }
+    #[test]
+    fn obstructed_ore_approach_can_switch_standing_point_without_abandoning_ore() {
+        let (mut world, state) = fixture();
+        let target = Pos { x: 5, y: 1, z: 3 };
+        world.patches.insert(target, world.scan.palette[2].clone());
+        let first = plan(
+            &world,
+            &state,
+            &Model::default(),
+            &HashSet::new(),
+            &HashMap::new(),
+        )
+        .expect("ore");
+        let second = plan(
+            &world,
+            &state,
+            &Model::default(),
+            &HashSet::from([first.stand]),
+            &HashMap::new(),
+        )
+        .expect("other approach");
+        assert_eq!(second.target, target);
+        assert_ne!(second.stand, first.stand);
+    }
+    #[test]
+    fn sealed_descent_uses_existing_upstairs_instead_of_stopping_or_jumping_a_cliff() {
+        let (mut world, state) = fixture();
+        world.scan.palette[0].diggable = false; // Bedrock-like bowl; only one carved stair exit.
+        let mut from = state.feet();
+        for to in [
+            Pos { x: 4, y: 2, z: 3 },
+            Pos { x: 5, y: 3, z: 3 },
+            Pos { x: 6, y: 4, z: 3 },
+        ] {
+            for p in clearance(from, to) {
+                world.clear(p);
+            }
+            from = to;
+        }
+        let chosen = plan(
+            &world,
+            &state,
+            &Model::default(),
+            &HashSet::new(),
+            &HashMap::new(),
+        )
+        .expect("stair detour");
+        assert!(!chosen.ore && chosen.stand.y > state.feet().y);
+        let mut from = state.feet();
+        for to in chosen.path {
+            assert!(world.cost(from, to).is_some());
+            from = to;
+        }
+        assert!(
+            world
+                .cost(state.feet(), state.feet().offset(1, -3, 0))
+                .is_none()
+        );
+        assert!(
+            world
+                .cost(state.feet(), state.feet().offset(1, 3, 0))
+                .is_none()
+        );
+    }
+    #[test]
+    fn liquid_on_direct_ore_route_is_detoured_with_full_buffer() {
+        for fluid in ["minecraft:water", "minecraft:lava"] {
+            let (mut world, mut state) = fixture();
+            world.scan.origin = Pos { x: 0, y: -4, z: 0 };
+            world.scan.size = Pos {
+                x: 17,
+                y: 14,
+                z: 17,
+            };
+            world.scan.cells = vec![0; 17 * 14 * 17];
+            world.patches.clear();
+            state.position = Point {
+                x: 3.5,
+                y: 1.,
+                z: 8.5,
+            };
+            world.clear(state.feet());
+            world.clear(state.feet().offset(0, 1, 0));
+            let target = Pos { x: 12, y: 1, z: 8 };
+            world.patches.insert(target, world.scan.palette[2].clone());
+            world.patches.insert(
+                Pos { x: 7, y: 1, z: 8 },
+                Block {
+                    block: fluid.into(),
+                    fluid: true,
+                    danger: true,
+                    ..Default::default()
+                },
+            );
+            let chosen = plan(
+                &world,
+                &state,
+                &Model::default(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
+            .expect("dry detour");
+            assert_eq!(chosen.target, target);
+            assert!(chosen.path.iter().any(|p| p.z != 8 || p.y != 1));
+            let mut from = state.feet();
+            for to in chosen.path {
+                assert!(world.cost(from, to).is_some(), "{fluid} at {to:?}");
+                from = to;
+            }
+        }
     }
     #[test]
     fn selected_ore_and_blocked_target_are_respected() {
@@ -490,8 +647,8 @@ pub mod tests {
             y: 16.,
             z: 16.5,
         };
-        world.clear(state.position.cell());
-        world.clear(state.position.cell().offset(0, 1, 0));
+        world.clear(state.feet());
+        world.clear(state.feet().offset(0, 1, 0));
         for x in [6, 12, 22, 27] {
             for y in [7, 14, 23] {
                 let pos = Pos { x, y, z: 22 };
@@ -545,7 +702,7 @@ pub mod tests {
     #[test]
     fn open_corridor_next_to_liquid_and_unknown_are_not_safe() {
         let (mut world, state) = fixture();
-        let to = state.position.cell().offset(1, 0, 0);
+        let to = state.feet().offset(1, 0, 0);
         world.clear(to);
         world.clear(to.offset(0, 1, 0));
         world.patches.insert(
@@ -557,7 +714,7 @@ pub mod tests {
                 ..Default::default()
             },
         );
-        assert!(world.cost(state.position.cell(), to).is_none());
+        assert!(world.cost(state.feet(), to).is_none());
         world.patches.insert(
             to.offset(1, 0, 0),
             crate::types::Block {
@@ -565,22 +722,22 @@ pub mod tests {
                 ..Default::default()
             },
         );
-        assert!(world.cost(state.position.cell(), to).is_none());
+        assert!(world.cost(state.feet(), to).is_none());
     }
 
     #[test]
     fn fresh_origin_floor_prevents_planning_from_an_air_center() {
         let (mut world, mut state) = fixture();
-        let floor = state.position.cell().offset(0, -1, 0);
-        let destination = state.position.cell().offset(1, 0, 0);
-        assert!(world.cost(state.position.cell(), destination).is_some());
+        let floor = state.feet().offset(0, -1, 0);
+        let destination = state.feet().offset(1, 0, 0);
+        assert!(world.cost(state.feet(), destination).is_some());
         state.navigation.source_floor = Some(crate::types::LocalBlock {
             pos: floor,
             kind: world.scan.palette[1].clone(),
             ..Default::default()
         });
         world.patch(&state);
-        assert!(world.cost(state.position.cell(), destination).is_none());
+        assert!(world.cost(state.feet(), destination).is_none());
         assert!(
             plan(
                 &world,
@@ -673,8 +830,8 @@ pub mod tests {
             z: 4.5,
         };
         state.mining_target = "minecraft:diamond_ore".into();
-        world.clear(state.position.cell());
-        world.clear(state.position.cell().offset(0, 1, 0));
+        world.clear(state.feet());
+        world.clear(state.feet().offset(0, 1, 0));
         world
             .patches
             .insert(Pos { x: 5, y: 5, z: 4 }, world.scan.palette[2].clone()); // not selected
@@ -688,8 +845,8 @@ pub mod tests {
         assert!(!choices.is_empty());
         for choice in choices {
             assert!(!choice.ore);
-            assert!(choice.stand.y <= state.position.cell().y - 6);
-            let mut from = state.position.cell();
+            assert!(choice.stand.y <= state.feet().y - 6);
+            let mut from = state.feet();
             for to in choice.path {
                 assert_eq!((to.x - from.x).abs() + (to.z - from.z).abs(), 1);
                 assert!((to.y - from.y).abs() <= 1);

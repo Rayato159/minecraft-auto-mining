@@ -38,6 +38,9 @@ final class ChestTransfer {
         return menu != null ? current == menu : age <= 60;
     }
     static void begin(Minecraft mc, BlockPos pos) {
+        NetherSafety.requireWorkSafe(mc);
+        if (NetherSafety.piglinsNearby(mc,pos))
+            throw new IllegalStateException("Piglin near storage; wait before opening the container.");
         if (!HomeSettings.storageArea(mc, pos) || !supported(mc, pos))
             throw new IllegalStateException("Chest is not supported or outside your home search area.");
         Vec3 center = Vec3.atCenterOf(pos);
@@ -61,7 +64,7 @@ final class ChestTransfer {
         if (close) mc.player.closeContainer();
     }
     static boolean keep(Minecraft mc, ItemStack stack) {
-        return PickaxeCraft.keepMaterial(mc,stack) || ClientBridge.matches(mc, stack, "pickaxe") || ClientBridge.matches(mc, stack, "sword") ||
+        return ToolChoice.utilityTool(stack) || PickaxeCraft.keepMaterial(mc,stack) || ClientBridge.matches(mc, stack, "pickaxe") || ClientBridge.matches(mc, stack, "sword") ||
             ClientBridge.matches(mc, stack, "food") || ClientBridge.matches(mc, stack, "torch");
     }
     private static boolean reservePick(Minecraft mc, ItemStack stack) {

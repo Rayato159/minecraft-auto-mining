@@ -374,9 +374,10 @@ impl Brain {
             / 12.;
         x[9] = if state.navigation.centered { 1. } else { 0. };
         x[10] = if state.has("food") { 1. } else { 0. };
-        x[11] = state.home.home.map_or(0., |h| {
-            (state.position.cell().distance(h) / 128.).min(1.) as f32
-        });
+        x[11] = state
+            .home
+            .home
+            .map_or(0., |h| (state.feet().distance(h) / 128.).min(1.) as f32);
         x[12] = 1. - x[0];
         x[13] = 1. - x[1];
         x[14] = 1. - x[8];

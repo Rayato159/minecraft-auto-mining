@@ -83,7 +83,7 @@ public final class ClientBridge {
     private static int scanHeight, scanCursor;
     private static int[] scanCells;
     private static final ArrayList<Map<String, Object>> scanPalette = new ArrayList<>();
-    private static final Map<Integer, Integer> scanStates = new java.util.HashMap<>();
+    private static final Map<Long, Integer> scanStates = new java.util.HashMap<>();
     private static long commandDeadline;
     private static BlockPos torchTarget;
     private static BlockPos centerTarget;
@@ -96,7 +96,7 @@ public final class ClientBridge {
     private ClientBridge() {}
 
     public static void initialize() {
-        try { Files.createDirectories(DIRECTORY); HomeSettings.load(); }
+        try { Files.createDirectories(DIRECTORY); HomeSettings.load(); MiningProfile.load(); }
         catch (IOException error) { LOGGER.error("Cannot create flyminer control directory", error); return; }
         MinecraftForge.EVENT_BUS.addListener(ClientBridge::registerCommands);
         MinecraftForge.EVENT_BUS.addListener(HomeSettings::register);
@@ -169,7 +169,7 @@ public final class ClientBridge {
         if (mc.level == null || mc.player == null) return java.util.List.of();
         return BuiltInRegistries.BLOCK.stream()
             .filter(block -> {
-                try { return block.defaultBlockState().is(Tags.Blocks.ORES) && block.defaultBlockState().getDestroySpeed(mc.level,mc.player.blockPosition())>=0; }
+                try { return NetherSafety.ore(block.defaultBlockState()) && block.defaultBlockState().getDestroySpeed(mc.level,mc.player.blockPosition())>=0; }
                 catch(RuntimeException error){return false;}
             })
             .map(block -> BuiltInRegistries.BLOCK.getKey(block).toString()).sorted().toList();
@@ -235,7 +235,17 @@ public final class ClientBridge {
             commandDeadline = System.currentTimeMillis() + 5000;
             travelling = command.has("travel") && command.get("travel").getAsBoolean();
             returning = travelling && command.has("returning") && command.get("returning").getAsBoolean();
+            if (!action.equals("breathe") && AirSupply.urgent(mc))
+                throw new IllegalStateException("Oxygen recovery preempts work; return to breathable air.");
+            if (Set.of("mine","traverse","route","step","center","torch","store","craft_pickaxe","open_passage","approach").contains(action))
+                MiningProfile.requireCover(mc);
+            if (Set.of("mine","traverse","route","center","torch","store","craft_pickaxe","open_passage").contains(action))
+                NetherSafety.requireWorkSafe(mc);
             switch (action) {
+                case "breathe" -> {
+                    BreathEscape.begin(mc); activeId=id; remainingTicks=500;
+                    result(id,"running","Finding breathable air; checking exit terrain and emergency tools.");
+                }
                 case "home_request" -> {
                     var p = HomeSettings.get(mc);
                     if (p.home == null) throw new IllegalStateException("Set home first.");
@@ -264,7 +274,12 @@ public final class ClientBridge {
                 }
                 case "scan" -> beginScan(mc, id);
                 case "center" -> beginCenter(mc, id);
-                case "torch" -> beginTorch(mc, id);
+                case "torch" -> beginTorch(mc, command, id);
+                case "escape" -> {
+                    if (!RecoveryMove.begin(mc, command.has("avoidThreats") && command.get("avoidThreats").getAsBoolean())) { result(id,"skipped","No supported dry escape corridor available yet."); break; }
+                    activeId=id; remainingTicks=80;
+                    result(id,"running","Retreating along a checked supported corridor.");
+                }
                 case "look" -> {
                     float yaw = command.get("yaw").getAsFloat();
                     float pitch = command.get("pitch").getAsFloat();
@@ -317,7 +332,7 @@ public final class ClientBridge {
                 default -> throw new IllegalArgumentException("Unknown action.");
             }
         } catch (Exception error) {
-            if (activeId != null || PickaxeCraft.active() || ChestTransfer.active() || Passages.active()) stop(mc,"error",error.getMessage());
+            if (activeId != null || PickaxeCraft.active() || ChestTransfer.active() || Passages.active() || BreathEscape.active()) stop(mc,"error",error.getMessage());
             combatApproach=false;
             result(id, "error", error.getMessage());
         }
@@ -332,8 +347,8 @@ public final class ClientBridge {
     }
 
     private static void beginMine(Minecraft mc, JsonObject command, String id) {
-        equip(mc, "pickaxe");
         BlockPos position = new BlockPos(coordinate(command, "x"), coordinate(command, "y"), coordinate(command, "z"));
+        ToolChoice.equip(mc, mc.level.getBlockState(position));
         BlockHitResult hit = validateMine(mc, position);
         BlockState state = mc.level.getBlockState(position);
         Vec3 delta = hit.getLocation().subtract(mc.player.getEyePosition());
@@ -350,8 +365,15 @@ public final class ClientBridge {
     }
 
     private static BlockHitResult validateMine(Minecraft mc, BlockPos position) {
+        return validateMine(mc, position, true);
+    }
+    private static BlockHitResult validateMine(Minecraft mc, BlockPos position, boolean equippedTool) {
+        MiningProfile.requireCover(mc);
+        if (!MiningProfile.mayMine(mc,position)) throw new IllegalStateException("Dwarf profile: this cut would open the roof to the sky.");
+        NetherSafety.requireWorkSafe(mc);
         LiquidSafety.requirePlayerClear(mc);
         if (HomeSettings.protectedAt(mc, position)) throw new IllegalStateException("Home protected area: digging is forbidden at every height.");
+        if (supportsTorch(mc, position)) throw new IllegalStateException("This block supports a torch; choose another cut.");
         if (mc.player.isInWater() || mc.player.isInLava() || !mc.player.onGround())
             throw new IllegalStateException("Mining requires dry, supported ground.");
         if (mc.player.getHealth() < 18) throw new IllegalStateException("Low health; pause mining.");
@@ -360,13 +382,20 @@ public final class ClientBridge {
             throw new IllegalStateException("Enemy nearby; interrupt mining.");
         if (!mc.level.hasChunkAt(position)) throw new IllegalStateException("Target chunk is not loaded.");
         BlockState state = mc.level.getBlockState(position);
-        if (state.hasBlockEntity() || (!isTerrain(state) && !state.is(Tags.Blocks.ORES)))
-            throw new IllegalArgumentException("Only stone and ore blocks are enabled in this prototype.");
-        BlockPos feet = mc.player.blockPosition();
+        if (state.hasBlockEntity() || (!isTerrain(state) && !NetherSafety.ore(state)))
+            throw new IllegalArgumentException("Only approved natural terrain and ore blocks may be mined.");
+        if (!NetherSafety.miningAllowed(mc,position,state))
+            throw new IllegalStateException("Piglin near guarded gold; do not provoke it.");
+        if (NetherSafety.active(mc) && position.getX()==mc.player.blockPosition().getX()
+            && position.getZ()==mc.player.blockPosition().getZ() && position.getY()>=StandingGeometry.feet(mc).getY()+2
+            && !NetherSafety.coveredAfterCut(mc,position))
+            throw new IllegalStateException("Nether mining requires a stable roof; do not open the last cover block.");
+        BlockPos feet = StandingGeometry.feet(mc);
         if (position.getX() == feet.getX() && position.getZ() == feet.getZ() && position.getY() < feet.getY())
             throw new IllegalStateException("Cannot mine beneath the player.");
         if (mc.player.getInventory().getFreeSlot() < 0 && !returning) throw new IllegalStateException("Inventory is full.");
-        if (state.requiresCorrectToolForDrops() && !mc.player.hasCorrectToolForDrops(state))
+        if (state.requiresCorrectToolForDrops() && (equippedTool
+            ? !mc.player.hasCorrectToolForDrops(state) : !ToolChoice.harvestable(mc, state)))
             throw new IllegalStateException("Hold a suitable pickaxe first.");
         if (state.getDestroySpeed(mc.level, position) < 0) throw new IllegalStateException("Unbreakable block.");
         if (!LiquidSafety.cellClear(mc,position)) throw new IllegalStateException("Water/lava or unknown terrain within two blocks of the mining target.");
@@ -419,6 +448,7 @@ public final class ClientBridge {
     }
     private static boolean checkedFloor(Minecraft mc, BlockPos feet) {
         if (!mc.level.hasChunkAt(feet)) return false;
+        if (MiningProfile.exposed(mc,feet) || MiningProfile.exposed(mc,feet.above())) return false;
         if (!LiquidSafety.bodyClear(mc,feet)) return false;
         BlockState floor = mc.level.getBlockState(feet.below());
         return Passages.supports(mc,feet.below(),floor) && !dangerous(floor) &&
@@ -430,12 +460,17 @@ public final class ClientBridge {
     // Recenter only along a collision-free, continuously supported horizontal sweep of the real body.
     private static boolean supportedBody(Minecraft mc, net.minecraft.world.phys.AABB box) {
         if (!LiquidSafety.bodyClear(mc,box)) return false;
+        return supportedDryBody(mc,box);
+    }
+    static boolean supportedDryBody(Minecraft mc, net.minecraft.world.phys.AABB box) {
+        if (!MiningProfile.safeBody(mc,box)) return false;
         if (!mc.level.noCollision(mc.player, box.deflate(.00001))) return false;
         var footing = new net.minecraft.world.phys.AABB(box.minX + .00001, box.minY - .06, box.minZ + .00001,
             box.maxX - .00001, box.minY, box.maxZ - .00001);
         for (BlockPos p : BlockPos.betweenClosed(BlockPos.containing(footing.minX, footing.minY, footing.minZ),
                 BlockPos.containing(box.maxX - .00001, box.maxY - .00001, box.maxZ - .00001))) {
-            if (!mc.level.hasChunkAt(p) || dangerous(mc.level.getBlockState(p))) return false;
+            if (!mc.level.hasChunkAt(p) || dangerous(mc.level.getBlockState(p)) ||
+                p.getY()<box.minY && mc.level.getBlockState(p).getBlock() instanceof net.minecraft.world.level.block.FallingBlock) return false;
         }
         for (var shape : mc.level.getBlockCollisions(mc.player, footing)) if (!shape.isEmpty()) return true;
         return false;
@@ -443,7 +478,7 @@ public final class ClientBridge {
 
     private static boolean safeCenterPath(Minecraft mc, BlockPos destination) {
         if (!mc.player.onGround() || mc.player.isInWater() || mc.player.isInLava() || mc.player.isPassenger() ||
-            Math.abs(mc.player.getY() - destination.getY()) > .12 || !safeFloor(mc, destination) ||
+            !StandingGeometry.atHeight(mc.player.getY(), StandingGeometry.floorY(mc, destination)) || !safeFloor(mc, destination) ||
             !clearAt(mc, destination) || !clearAt(mc, destination.above())) return false;
         double dx = destination.getX() + .5 - mc.player.getX();
         double dz = destination.getZ() + .5 - mc.player.getZ();
@@ -457,7 +492,7 @@ public final class ClientBridge {
     }
 
     private static BlockPos findAnchor(Minecraft mc) {
-        BlockPos feet = mc.player.blockPosition();
+        BlockPos feet = StandingGeometry.feet(mc);
         var candidates = new ArrayList<BlockPos>();
         for (int x = -1; x <= 1; x++) for (int z = -1; z <= 1; z++) candidates.add(feet.offset(x, 0, z));
         candidates.sort(java.util.Comparator.comparingDouble(p ->
@@ -510,11 +545,15 @@ public final class ClientBridge {
     }
     private static boolean checkedClear(Minecraft mc, BlockPos pos) {
         if (!mc.level.hasChunkAt(pos)) return false;
+        if (MiningProfile.exposed(mc,pos)) return false;
         BlockState block = mc.level.getBlockState(pos);
         return !dangerous(block) && Passages.clear(mc,pos,block);
     }
 
     private static void validateTraverse(Minecraft mc, BlockPos from, BlockPos to) {
+        MiningProfile.requireCover(mc);
+        AirSupply.requireEntry(mc,to);
+        NetherSafety.requireWorkSafe(mc);
         LiquidSafety.requirePlayerClear(mc);
         if (to.getY()>from.getY() && (!LiquidSafety.cellClear(mc,from.above(3)) || !LiquidSafety.cellClear(mc,to.above(2))))
             throw new IllegalStateException("Water/lava or unknown terrain within two blocks of the jump headroom.");
@@ -538,7 +577,7 @@ public final class ClientBridge {
 
     private static void beginTraverse(Minecraft mc, JsonObject command, String id) {
         moveQueue.clear();
-        BlockPos from = mc.player.blockPosition();
+        BlockPos from = StandingGeometry.feet(mc);
         BlockPos to = new BlockPos(coordinate(command, "x"), coordinate(command, "y"), coordinate(command, "z"));
         if (!mc.player.onGround() || Math.abs(to.getX() - from.getX()) + Math.abs(to.getZ() - from.getZ()) != 1 ||
             Math.abs(to.getY() - from.getY()) > 1)
@@ -556,7 +595,7 @@ public final class ClientBridge {
     private static void beginRoute(Minecraft mc, JsonObject command, String id) {
         var path = command.getAsJsonArray("path");
         if (path == null || path.size() < 2 || path.size() > 8) throw new IllegalArgumentException("Route needs 2..8 checked cells.");
-        BlockPos from = mc.player.blockPosition();
+        BlockPos from = StandingGeometry.feet(mc);
         var checked = new java.util.ArrayDeque<BlockPos>();
         int dx = 0, dz = 0;
         for (var entry : path) {
@@ -586,7 +625,7 @@ public final class ClientBridge {
         if (distance < .14 && speed < .025) {
             walkingKey.setDown(false);
             mc.options.keyJump.setDown(false);
-            if (mc.player.onGround() && Math.abs(mc.player.getY() - moveTarget.getY()) < .12)
+            if (StandingGeometry.landed(mc, moveTarget))
                 stop(mc, "done", "Reached checked route destination.");
             return;
         }
@@ -609,7 +648,7 @@ public final class ClientBridge {
     }
 
     private static boolean isTerrain(BlockState state) {
-        return STONE.contains(state.getBlock()) || MOD_TERRAIN.contains(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+        return STONE.contains(state.getBlock()) || NetherSafety.terrain(state) || MOD_TERRAIN.contains(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
     }
 
     static boolean matches(Minecraft mc, ItemStack stack, String kind) {
@@ -636,9 +675,12 @@ public final class ClientBridge {
         var inventory = mc.player.getInventory();
         int selected = -1;
         double best = -1;
+        // Prefer a tool that harvests the chosen ore even when another tool is faster.
+        boolean targetToolAvailable = kind.equals("pickaxe") && inventory.items.stream().anyMatch(stack -> harvestsTarget(mc,stack));
         for (int slot = 0; slot < inventory.items.size(); slot++) {
             ItemStack stack = inventory.items.get(slot);
             if (!matches(mc, stack, kind)) continue;
+            if (targetToolAvailable && !harvestsTarget(mc,stack)) continue;
             double score = kind.equals("pickaxe") ? stack.getDestroySpeed(Blocks.STONE.defaultBlockState()) +
                 (stack.isCorrectToolForDrops(Blocks.DIAMOND_ORE.defaultBlockState()) ? 100 :
                     stack.isCorrectToolForDrops(Blocks.IRON_ORE.defaultBlockState()) ? 50 : 0) :
@@ -655,8 +697,9 @@ public final class ClientBridge {
         inventory.selected = selected;
     }
 
-    private static boolean hostileToPlayer(Minecraft mc, LivingEntity entity) {
+    static boolean hostileToPlayer(Minecraft mc, LivingEntity entity) {
         if (entity == mc.player || !entity.isAlive() || entity.isAlliedTo(mc.player)) return false;
+        if (NetherSafety.active(mc) && NetherSafety.avoidOnly(entity)) return false;
         if (entity instanceof net.minecraft.world.entity.NeutralMob neutral && !neutral.isAngryAt(mc.player)) return false;
         return entity.isAlive() && (entity instanceof Enemy || entity.getType().getCategory()==net.minecraft.world.entity.MobCategory.MONSTER || entity instanceof Mob mob && mob.getTarget() == mc.player);
     }
@@ -674,22 +717,44 @@ public final class ClientBridge {
         return !block.requiresCorrectToolForDrops() || stack.isCorrectToolForDrops(block);
     }
 
-    private static void beginTorch(Minecraft mc, String id) {
+    private static boolean supportsTorch(Minecraft mc, BlockPos support) {
+        if (mc.level.getBlockState(support.above()).is(Blocks.TORCH)) return true;
+        for (Direction face:Direction.Plane.HORIZONTAL) {
+            BlockState neighbor=mc.level.getBlockState(support.relative(face));
+            if (neighbor.is(Blocks.WALL_TORCH) && neighbor.getValue(net.minecraft.world.level.block.WallTorchBlock.FACING)==face) return true;
+        }
+        return false;
+    }
+    private static void beginTorch(Minecraft mc, JsonObject command, String id) {
+        NetherSafety.requireWorkSafe(mc);
+        LiquidSafety.requirePlayerClear(mc);
         if (!mc.player.onGround() || mc.player.isInWater() || mc.player.isInLava())
             throw new IllegalStateException("Torch placement needs dry ground.");
-        var candidates = new ArrayList<BlockPos>();
-        BlockPos feet = mc.player.blockPosition();
-        for (int x = -2; x <= 2; x++) for (int z = -2; z <= 2; z++)
-            if (Math.abs(x) + Math.abs(z) >= 1 && Math.abs(x) + Math.abs(z) <= 3) candidates.add(feet.offset(x, 0, z));
-        java.util.Collections.shuffle(candidates);
-        for (BlockPos pos : candidates) {
-            if (!mc.level.hasChunkAt(pos) || !mc.level.getBlockState(pos).isAir() || !safeFloor(mc, pos) ||
-                !Blocks.TORCH.defaultBlockState().canSurvive(mc.level, pos)) continue;
-            Vec3 point = new Vec3(pos.getX() + .5, pos.getY() - .001, pos.getZ() + .5);
+        BlockPos feet = StandingGeometry.feet(mc);
+        if (!command.has("forwardX") || !command.has("forwardZ")) {
+            result(id,"skipped","No planned digging direction supplied; leaving torches in inventory."); return;
+        }
+        int dx=coordinate(command,"forwardX"), dz=coordinate(command,"forwardZ");
+        var avoid=new java.util.HashSet<BlockPos>();
+        if (command.has("avoid")) {
+            var entries=command.getAsJsonArray("avoid");
+            if(entries.size()>128)throw new IllegalArgumentException("Too many planned cuts.");
+            for(var entry:entries){var p=entry.getAsJsonObject();avoid.add(new BlockPos(coordinate(p,"x"),coordinate(p,"y"),coordinate(p,"z")));}
+        }
+        for (var spot:TorchPlacement.candidates(feet,dx,dz,avoid)) {
+            BlockPos pos=spot.position(), support=spot.support();
+            Direction face=spot.face();
+            BlockState torch=face==Direction.UP ? Blocks.TORCH.defaultBlockState() :
+                Blocks.WALL_TORCH.defaultBlockState().setValue(net.minecraft.world.level.block.WallTorchBlock.FACING,face);
+            if (!mc.level.hasChunkAt(pos) || !mc.level.hasChunkAt(support) ||
+                !mc.level.getBlockState(pos).isAir() || mc.level.getBlockState(support).hasBlockEntity() ||
+                dangerous(mc.level.getBlockState(support)) || !LiquidSafety.cellClear(mc,pos) ||
+                !torch.canSurvive(mc.level,pos)) continue;
+            Vec3 point=Vec3.atCenterOf(support).add(Vec3.atLowerCornerOf(face.getNormal()).scale(.499));
             if (mc.player.getEyePosition().distanceTo(point) > mc.gameMode.getPickRange()) continue;
             BlockHitResult hit = mc.level.clip(new ClipContext(mc.player.getEyePosition(), point,
                 ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
-            if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(pos.below()) || hit.getDirection() != Direction.UP) continue;
+            if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(support) || hit.getDirection() != face) continue;
             equip(mc, "torch");
             Vec3 delta = point.subtract(mc.player.getEyePosition());
             mc.player.setYRot((float) (Math.toDegrees(Math.atan2(delta.z, delta.x)) - 90));
@@ -698,10 +763,10 @@ public final class ClientBridge {
             if (placed.consumesAction()) {
                 mc.player.swing(InteractionHand.MAIN_HAND); torchTarget = pos;
                 activeId = id; remainingTicks = 40; changedTicks = 0;
-                result(id, "running", "Placing a torch on a checked nearby floor."); return;
+                result(id, "running", "Placing a torch behind the planned cuts (wall preferred)."); return;
             }
         }
-        throw new IllegalStateException("No reachable safe torch placement nearby.");
+        result(id,"skipped","No rear torch support outside the planned cuts; continuing without placement.");
     }
 
     private static void validateAttack(Minecraft mc, LivingEntity entity) {
@@ -717,7 +782,7 @@ public final class ClientBridge {
     private static Map<String, Object> describeBlock(Minecraft mc, BlockPos position) {
         Map<String, Object> info = properties(mc, position);
         info.put("x", position.getX()); info.put("y", position.getY()); info.put("z", position.getZ());
-        try { validateMine(mc, position); info.put("mineable", true); }
+        try { validateMine(mc, position, false); info.put("mineable", true); }
         catch (RuntimeException error) { info.put("mineable", false); info.put("reason", error.getMessage()); }
         return info;
     }
@@ -736,20 +801,22 @@ public final class ClientBridge {
         }
         BlockState block = mc.level.getBlockState(pos);
         float hardness = block.getDestroySpeed(mc.level, pos);
-        boolean correct = !block.requiresCorrectToolForDrops() || mc.player.hasCorrectToolForDrops(block);
+        boolean correct = ToolChoice.harvestable(mc, block);
+        boolean exposed = MiningProfile.exposed(mc,pos);
         info.put("block", BuiltInRegistries.BLOCK.getKey(block.getBlock()).toString());
-        info.put("ore", block.is(Tags.Blocks.ORES));
-        info.put("clear", !dangerous(block) && Passages.clear(mc,pos,block));
+        info.put("ore", NetherSafety.ore(block));
+        info.put("clear", !exposed && !dangerous(block) && Passages.clear(mc,pos,block));
         info.put("support", Passages.supports(mc,pos,block));
-        info.put("openable", !dangerous(block) && Passages.canOpen(block));
-        info.put("danger", dangerous(block));
+        info.put("openable", !exposed && !dangerous(block) && Passages.canOpen(block));
+        info.put("danger", exposed || dangerous(block));
         info.put("fluid", !block.getFluidState().isEmpty());
+        info.put("water", block.getFluidState().is(net.minecraft.tags.FluidTags.WATER));
         info.put("falling", block.getBlock() instanceof net.minecraft.world.level.block.FallingBlock);
-        info.put("diggable", !block.hasBlockEntity() && (isTerrain(block) || block.is(Tags.Blocks.ORES)) &&
-            correct && hardness >= 0 && !dangerous(block));
-        // Vanilla break-progress calculation includes enchantments and status effects.
-        float progress = block.getDestroyProgress(mc.player, mc.level, pos);
-        info.put("seconds", Float.isFinite(progress) && progress > 0 ? Math.min(3600, Math.ceil(1.0 / progress) / 20.0) : 3600);
+        info.put("diggable", !block.hasBlockEntity() && (isTerrain(block) || NetherSafety.ore(block)) &&
+            correct && hardness >= 0 && !exposed && MiningProfile.mayMine(mc,pos) && !dangerous(block) && !supportsTorch(mc,pos) && NetherSafety.miningAllowed(mc,pos,block));
+        // Preview the tool we will select, not whichever item a previous action left in hand.
+        double seconds = ToolChoice.seconds(mc, pos);
+        info.put("seconds", Double.isFinite(seconds) ? Math.min(3600, seconds) : 3600);
         return info;
     }
 
@@ -780,7 +847,8 @@ public final class ClientBridge {
                 if (HomeSettings.storageArea(mc, pos) && ChestTransfer.supported(mc, pos))
                     scanChests.add(Map.of("x", pos.getX(), "y", pos.getY(), "z", pos.getZ()));
                 BlockState state = mc.level.getBlockState(pos);
-                int key = Block.getId(state);
+                long key = MiningProfile.paletteKey(Block.getId(state),supportsTorch(mc,pos),!NetherSafety.miningAllowed(mc,pos,state),
+                    MiningProfile.exposed(mc,pos),!MiningProfile.mayMine(mc,pos));
                 Integer paletteId = scanStates.get(key);
                 if (paletteId == null) {
                     paletteId = scanPalette.size(); scanStates.put(key, paletteId);
@@ -806,7 +874,7 @@ public final class ClientBridge {
     }
 
     private static Map<String, Object> navigation(Minecraft mc) {
-        BlockPos feet = mc.player.blockPosition();
+        BlockPos feet = StandingGeometry.feet(mc);
         var directions = new ArrayList<Map<String, Object>>();
         var routes = new ArrayList<Map<String, Object>>();
         for (Direction direction : Direction.Plane.HORIZONTAL) {
@@ -827,7 +895,7 @@ public final class ClientBridge {
         }
         var ores = new ArrayList<Map<String, Object>>();
         for (BlockPos pos : BlockPos.betweenClosed(feet.offset(-4, -2, -4), feet.offset(4, 4, 4))) {
-            if (mc.level.hasChunkAt(pos) && mc.level.getBlockState(pos).is(Tags.Blocks.ORES)) {
+            if (mc.level.hasChunkAt(pos) && NetherSafety.ore(mc.level.getBlockState(pos))) {
                 var block = describeBlock(mc, pos);
                 if (Boolean.TRUE.equals(block.get("mineable"))) ores.add(block);
             }
@@ -835,6 +903,7 @@ public final class ClientBridge {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("directions", directions); result.put("routes", routes); result.put("ores", ores);
         result.put("sourceFloor", describeBlock(mc, feet.below()));
+        result.put("feet", Map.of("x", feet.getX(), "y", feet.getY(), "z", feet.getZ()));
         boolean originSafe = safeFloor(mc, feet);
         boolean centered = originSafe && Math.hypot(mc.player.getX() - feet.getX() - .5, mc.player.getZ() - feet.getZ() - .5) < .12;
         result.put("originSafe", originSafe); result.put("centered", centered);
@@ -855,6 +924,8 @@ public final class ClientBridge {
             stop(mc, completedStep ? "done" : "error", completedStep ? "Step finished." : "Action timed out.");
             return;
         }
+        if (!BreathEscape.active() && scanCells == null && enemy == null && !eating)
+            MiningProfile.requireCover(mc);
         if (ChestTransfer.active()) {
             String completed = ChestTransfer.update(mc);
             if (completed != null) stop(mc, "done", completed);
@@ -871,9 +942,22 @@ public final class ClientBridge {
             return;
         }
         if (scanCells != null) { updateScan(mc); return; }
+        if (RecoveryMove.active()) {
+            String complete=RecoveryMove.update(mc);
+            if(complete!=null)stop(mc,"done",complete);
+            return;
+        }
+        if (BreathEscape.active()) {
+            String complete=BreathEscape.update(mc);
+            if(complete!=null)stop(mc,"done",complete);
+            return;
+        }
+        if(AirSupply.urgent(mc)) {stop(mc,"interrupted","Oxygen recovery preempts the current action.");return;}
+        if (enemy==null && !eating && !RecoveryMove.active() && walkDirection==null)
+            NetherSafety.requireWorkSafe(mc);
         if (centerTarget != null) { updateCenter(mc); return; }
         if (torchTarget != null) {
-            if (mc.level.getBlockState(torchTarget).is(Blocks.TORCH) && ++changedTicks >= 2)
+            if ((mc.level.getBlockState(torchTarget).is(Blocks.TORCH) || mc.level.getBlockState(torchTarget).is(Blocks.WALL_TORCH)) && ++changedTicks >= 2)
                 stop(mc, "done", "Torch placed.");
             return;
         }
@@ -888,6 +972,7 @@ public final class ClientBridge {
             validateAttack(mc, enemy);
             if (!matches(mc,mc.player.getMainHandItem(),"sword")) throw new IllegalStateException("Sword not equipped; retry after inventory sync.");
             if (mc.player.getAttackStrengthScale(0.5F) >= 0.9F) {
+                if(!CombatSafety.safeSwordTick(mc,enemy))return;
                 Vec3 delta = enemy.getEyePosition().subtract(mc.player.getEyePosition());
                 mc.player.setYRot((float) (Math.toDegrees(Math.atan2(delta.z, delta.x)) - 90));
                 mc.player.setXRot((float) -Math.toDegrees(Math.atan2(delta.y, Math.hypot(delta.x, delta.z))));
@@ -916,6 +1001,8 @@ public final class ClientBridge {
         ChestTransfer.cancel(mc);
         PickaxeCraft.cancel(mc);
         Passages.cancel();
+        RecoveryMove.cancel(mc);
+        BreathEscape.cancel(mc);
         if (eating) { mc.options.keyUse.setDown(false); if (mc.gameMode != null && mc.player != null) mc.gameMode.releaseUsingItem(mc.player); }
         if (walkingKey != null) walkingKey.setDown(false);
         if (moveTarget != null) mc.options.keyJump.setDown(false);
@@ -942,7 +1029,7 @@ public final class ClientBridge {
         combatApproach=false;
     }
 
-    private static String actionName() { return Passages.active() ? "open_passage" : PickaxeCraft.active() ? "craft_pickaxe" : ChestTransfer.active() ? "store" : centerTarget != null ? "center" : torchTarget != null ? "torch" : scanCells != null ? "scan" : target != null ? "mine" : moveTarget != null ? "traverse" : walkingKey != null ? "step" : eating ? "eat" : enemy != null ? "attack" : "idle"; }
+    private static String actionName() { return BreathEscape.active() ? "breathe" : RecoveryMove.active() ? "escape" : Passages.active() ? "open_passage" : PickaxeCraft.active() ? "craft_pickaxe" : ChestTransfer.active() ? "store" : centerTarget != null ? "center" : torchTarget != null ? "torch" : scanCells != null ? "scan" : target != null ? "mine" : moveTarget != null ? "traverse" : walkingKey != null ? "step" : eating ? "eat" : enemy != null ? "attack" : "idle"; }
 
     private static void result(String id, String status, String message) {
         lastId = id;
@@ -960,7 +1047,8 @@ public final class ClientBridge {
     private static void writeStateChecked(Minecraft mc) {
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("updatedAt", System.currentTimeMillis());
-        state.put("bridgeVersion", "0.7.1");
+        state.put("bridgeVersion", "0.11.0");
+        state.put("capabilities", java.util.List.of("hazard_recovery","rear_torches","nether_mining","oxygen_escape","fractional_floor","block_tools","mining_profile"));
         state.put("protocol", 8);
         state.put("miningTarget", miningTarget);
         state.put("controller", "local bridge; controller identity is in the external run log");
@@ -972,6 +1060,8 @@ public final class ClientBridge {
         state.put("lastResult", Map.of("id", lastId, "status", lastStatus, "message", lastMessage));
         if (mc.player != null && mc.level != null) {
             state.put("home", HomeSettings.get(mc));
+            state.put("oxygen", AirSupply.state(mc));
+            state.put("miningProfile", MiningProfile.state(mc));
             state.put("username", mc.player.getGameProfile().getName());
             state.put("server", sessionId(mc));
             state.put("position", Map.of("x", mc.player.getX(), "y", mc.player.getY(), "z", mc.player.getZ()));
@@ -982,6 +1072,8 @@ public final class ClientBridge {
             state.put("onGround", mc.player.onGround());
             state.put("inWater", mc.player.isInWater());
             state.put("inLava", mc.player.isInLava());
+            state.put("onFire", mc.player.isOnFire());
+            state.put("fireResistant", mc.player.hasEffect(net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE));
             state.put("liquidSafe", LiquidSafety.bodyClear(mc,mc.player.getBoundingBox()));
             state.put("lightLevel", mc.level.getMaxLocalRawBrightness(mc.player.blockPosition()));
             state.put("freeSlots", mc.player.getInventory().items.stream().filter(ItemStack::isEmpty).count());
@@ -1003,13 +1095,16 @@ public final class ClientBridge {
             state.put("inventory", inventory);
             state.put("navigation", navigation(mc));
             var hostiles = new ArrayList<Map<String, Object>>();
-            for (LivingEntity hostile : mc.level.getEntitiesOfClass(LivingEntity.class, mc.player.getBoundingBox().inflate(10), entity -> hostileToPlayer(mc, entity))) {
+            for (LivingEntity hostile : mc.level.getEntitiesOfClass(LivingEntity.class, mc.player.getBoundingBox().inflate(NetherSafety.active(mc)?32:10),
+                entity -> entity.isAlive() && !entity.isAlliedTo(mc.player) && (hostileToPlayer(mc, entity) || NetherSafety.active(mc) && NetherSafety.avoidOnly(entity)))) {
                 var info = new LinkedHashMap<String,Object>(Map.of("id", hostile.getId(), "uuid", hostile.getUUID().toString(),
                     "type", BuiltInRegistries.ENTITY_TYPE.getKey(hostile.getType()).toString(),
                     "x", hostile.getX(), "y", hostile.getY(), "z", hostile.getZ(), "health", hostile.getHealth(),
                     "distance", mc.player.distanceTo(hostile), "visible", mc.player.hasLineOfSight(hostile),
                     "exploding", hostile instanceof net.minecraft.world.entity.monster.Creeper creeper && creeper.getSwellDir() > 0));
                 info.put("attackDistance",attackDistance(mc,hostile));
+                info.put("ranged",NetherSafety.ranged(hostile));
+                info.put("avoidOnly",NetherSafety.active(mc)&&NetherSafety.avoidOnly(hostile));
                 hostiles.add(info);
             }
             state.put("hostiles", hostiles);

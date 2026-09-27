@@ -107,7 +107,10 @@ impl Bridge {
                 .context("Start Minecraft with the Mining Bridge first")?,
         )?;
         if s.updated_at > now() + 1000 || now().saturating_sub(s.updated_at) > 5000 {
-            bail!("Game state is stale; Minecraft is closed or frozen");
+            bail!(
+                "Game state is stale at {}; open the Minecraft profile selected by MC_INSTANCE or --instance (the game may be closed or frozen)",
+                self.dir.display()
+            );
         }
         if s.protocol != 8 {
             bail!(
@@ -177,12 +180,28 @@ impl Bridge {
         if self.remaining == Some(0) {
             return Err(Cancelled("Bounded run reached its action limit").into());
         }
-        if !before.enabled || !before.expected_session || before.screen_open || before.health <= 0.
-        {
-            bail!("Control disabled, menu open, or wrong session");
+        require_enabled(&before)?;
+        if before.screen_open {
+            bail!(
+                "FlyMiner is enabled, but a game menu/chat is open. Close it before sending an action"
+            );
+        }
+        if before.health <= 0. {
+            bail!("Player is dead; respawn and enable FlyMiner again");
         }
         let action = command["action"].as_str().unwrap_or("").to_string();
         let travel = command["travel"].as_bool().unwrap_or(false);
+        let threat_retreat = action == "escape" && command["avoidThreats"] == true;
+        if before.oxygen.needs_escape && action != "breathe" {
+            return Ok((
+                Outcome {
+                    status: "interrupted".into(),
+                    message: "Oxygen recovery preempts work".into(),
+                    ..Outcome::default()
+                },
+                before,
+            ));
+        }
         self.beat()?;
         let id = self.publish(command)?;
         if let Some(remaining) = &mut self.remaining {
@@ -202,6 +221,17 @@ impl Bridge {
             if state.session_key() != before.session_key() || !state.enabled {
                 self.stop()?;
                 return Err(Cancelled("Session changed or control disabled").into());
+            }
+            if state.oxygen.needs_escape && action != "breathe" {
+                self.stop()?;
+                return Ok((
+                    Outcome {
+                        id,
+                        status: "interrupted".into(),
+                        message: "Oxygen recovery preempts work".into(),
+                    },
+                    self.state()?,
+                ));
             }
             if state.goal_key() != before.goal_key()
                 || state.home.revision != before.home.revision
@@ -233,7 +263,10 @@ impl Bridge {
                     | "store"
                     | "craft_pickaxe"
                     | "open_passage"
-            ) && (threatened
+                    | "escape"
+                    | "torch"
+            ) && ((threatened && !threat_retreat)
+                || action != "escape" && crate::nether::interrupts_work(&state)
                 || state.health < (if travel && action != "mine" { 9. } else { 18. })
                 || state.in_lava)
             {
@@ -251,6 +284,7 @@ impl Bridge {
                 > Duration::from_secs(match action.as_str() {
                     "store" => 75,
                     "craft_pickaxe" => 180,
+                    "breathe" => 30,
                     _ => 25,
                 })
             {
@@ -273,9 +307,43 @@ impl Bridge {
     }
 }
 
+pub fn require_enabled(state: &State) -> Result<()> {
+    if !state.expected_session {
+        bail!("Minecraft has no active world/server. Join the world in the selected profile first");
+    }
+    if !state.enabled {
+        bail!(
+            "FlyMiner control is disabled for {}. Run /flyminer enable in this session (rejoining, changing dimension or dying requires enabling again)",
+            state.server
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_diagnostics_distinguish_disconnected_disabled_and_open_menu() {
+        let mut state = State::default();
+        assert!(
+            require_enabled(&state)
+                .expect_err("disconnected")
+                .to_string()
+                .contains("no active world")
+        );
+        state.expected_session = true;
+        state.server = "new.example:27920".into();
+        assert!(
+            require_enabled(&state)
+                .expect_err("disabled")
+                .to_string()
+                .contains("disabled for new.example:27920")
+        );
+        state.enabled = true;
+        state.screen_open = true;
+        require_enabled(&state).expect("Menu must not be reported as missing enable");
+    }
     #[test]
     fn publication_and_lock_are_exclusive() {
         let root = std::env::temp_dir().join(format!("miner-ipc-{}", now()));

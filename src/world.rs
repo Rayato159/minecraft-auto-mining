@@ -117,14 +117,31 @@ impl World {
         })
     }
     pub fn cost_with(&self, from: Pos, to: Pos, dry: &impl Fn(Pos) -> bool) -> Option<f64> {
+        if (to.x - from.x).abs() + (to.z - from.z).abs() != 1 || (to.y - from.y).abs() > 1 {
+            return None;
+        }
         if !self.supported(from) || !self.supported(to) || !dry(from) || !dry(from.offset(0, 1, 0))
+        {
+            return None;
+        }
+        let blocks = clearance(from, to);
+        if self.scan.dimension == crate::nether::DIMENSION
+            && !crate::nether::covered(
+                &|p| {
+                    if blocks.contains(&p) {
+                        None
+                    } else {
+                        self.get(p)
+                    }
+                },
+                to,
+            )
         {
             return None;
         }
         if to.y > from.y && (!dry(from.offset(0, 3, 0)) || !dry(to.offset(0, 2, 0))) {
             return None; // The head rises above its final standing height during a jump.
         }
-        let blocks = clearance(from, to);
         if blocks.iter().any(|p| !self.can_clear_with(*p, dry)) {
             return None;
         }

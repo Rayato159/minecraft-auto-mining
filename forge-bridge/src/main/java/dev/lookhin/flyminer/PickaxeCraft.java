@@ -32,6 +32,9 @@ final class PickaxeCraft {
     private static Recipe<?> recipe;
     private static boolean furnaceClaimed;
     private static String lastReason="";
+    private static String furnaceSession="";
+    private static final Set<BlockPos> ownedFurnaces=new HashSet<>();
+    static boolean claimableFurnace(boolean slotsEmpty,boolean lit,boolean ours){return slotsEmpty&&(!lit||ours);}
 
     static boolean active(){return running;}
     static boolean owned(Minecraft mc){
@@ -189,8 +192,13 @@ final class PickaxeCraft {
         if(!open(mc,Blocks.FURNACE))return;
         var menu=(FurnaceMenu)ownedMenu;
         if(!furnaceClaimed){
-            if(!menu.getSlot(0).getItem().isEmpty()||!menu.getSlot(1).getItem().isEmpty()||!menu.getSlot(2).getItem().isEmpty()||menu.isLit())throw new IllegalStateException("Furnace is already in use; refusing to alter another smelting job.");
+            if(menu.getStateId()==0){if(++wait>60)throw new IllegalStateException("Initial furnace inventory has not arrived from the server.");return;}
+            String session=ClientBridge.sessionId(mc)+"|"+mc.player.getUUID()+"|"+mc.level.dimension().location();
+            if(!session.equals(furnaceSession)){ownedFurnaces.clear();furnaceSession=session;}
+            boolean empty=menu.getSlot(0).getItem().isEmpty()&&menu.getSlot(1).getItem().isEmpty()&&menu.getSlot(2).getItem().isEmpty();
+            if(!claimableFurnace(empty,menu.isLit(),ownedFurnaces.contains(station)))throw new IllegalStateException("Furnace is already in use; refusing to alter another smelting job.");
             furnaceClaimed=true;
+            ownedFurnaces.add(station.immutable());
         }
         if(!menu.getSlot(2).getItem().isEmpty()){
             if(!menu.getSlot(2).getItem().is(Items.IRON_INGOT))throw new IllegalStateException("Unexpected furnace output.");
@@ -202,10 +210,10 @@ final class PickaxeCraft {
             close(mc);return;
         }
         if(menu.getSlot(0).getItem().isEmpty()){
-            int slot=inventorySlot(mc,PickaxeCraft::rawIron);if(slot<0)throw new IllegalStateException("Iron feedstock ran out.");
+            int slot=inventorySlot(mc,PickaxeCraft::rawIron);if(slot<0)throw new IllegalStateException("Smelting feedstock ran out.");
             var stack=menu.getSlot(slot).getItem();
             boolean valid=mc.level.getRecipeManager().getAllRecipesFor(RecipeType.SMELTING).stream().anyMatch(r->r.getIngredients().get(0).test(stack)&&r.getResultItem(mc.level.registryAccess()).is(Items.IRON_INGOT));
-            if(!valid)throw new IllegalStateException("Server recipe does not smelt this ore into iron.");
+            if(!valid)throw new IllegalStateException("Server smelting recipe changed.");
             click(mc,slot,false);return;
         }
         if(!menu.isLit()&&menu.getSlot(1).getItem().isEmpty()){

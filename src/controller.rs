@@ -25,6 +25,22 @@ impl std::fmt::Display for Paused {
     }
 }
 impl std::error::Error for Paused {}
+
+#[derive(Default)]
+struct RouteFailures(HashMap<Pos, (u32, Instant)>);
+impl RouteFailures {
+    fn reject(&mut self, to: Pos, at: Instant) -> Instant {
+        self.0
+            .retain(|_, (_, seen)| at.saturating_duration_since(*seen) < Duration::from_secs(600));
+        let (count, seen) = self.0.entry(to).or_insert((0, at));
+        *count = count.saturating_add(1);
+        *seen = at;
+        at + Duration::from_secs(30 * (1_u64 << (*count - 1).min(2)))
+    }
+    fn reached(&mut self, to: Pos) {
+        self.0.remove(&to);
+    }
+}
 fn pause(message: impl Into<String>) -> anyhow::Error {
     Paused(message.into()).into()
 }
@@ -111,6 +127,37 @@ fn status(bridge: &Bridge, board: &mut Scoreboard, mode: &str, message: &str) ->
     board.updated_at = now();
     atomic_json(&bridge.runtime.join("scoreboard.json"), board)
 }
+fn idle_retry(bridge: &mut Bridge, board: &mut Scoreboard, message: &str) -> Result<()> {
+    status(bridge, board, "reroute", message)?;
+    let began = Instant::now();
+    let before = bridge.state()?;
+    let nearest = |state: &State| {
+        state
+            .hostiles
+            .iter()
+            .filter(|e| e.visible)
+            .map(|e| e.reach_distance())
+            .fold(4.5_f64, f64::min)
+    };
+    let previous_threat = nearest(&before);
+    while began.elapsed() < Duration::from_secs(3) && !bridge.stopped() {
+        bridge.beat()?;
+        let state = bridge.state()?;
+        if !state.enabled
+            || state.screen_open
+            || state.home.revision != before.home.revision
+            || state.goal_key() != before.goal_key()
+            || state.health < before.health
+            || nearest(&state) < previous_threat
+            || state.oxygen.needs_escape
+            || crate::nether::interrupts_work(&state) && !crate::nether::interrupts_work(&before)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
 fn action(
     bridge: &mut Bridge,
     board: &mut Scoreboard,
@@ -143,7 +190,7 @@ fn action(
     Ok((outcome.status == "done", state))
 }
 fn retreat(bridge: &mut Bridge, board: &mut Scoreboard, state: &State) -> Result<bool> {
-    let here = state.position.cell();
+    let here = state.feet();
     let safe = state
         .navigation
         .routes
@@ -182,6 +229,13 @@ fn retreat(bridge: &mut Bridge, board: &mut Scoreboard, state: &State) -> Result
 }
 
 #[derive(Clone, Copy, PartialEq)]
+pub enum StartMode {
+    Resume,
+    MineHere,
+    MineWaypoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum TripPhase {
     Home,
     Mine,
@@ -192,6 +246,22 @@ struct MineResume {
     home_revision: u64,
     request: u64,
     mine: Pos,
+}
+impl MineResume {
+    fn clear_for_session(runtime: &std::path::Path, state: &State) -> Result<()> {
+        let path = runtime.join("resume-mine.json");
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let saved: Self = serde_json::from_slice(&bytes)?;
+                if saved.session == state.session_key() {
+                    fs::remove_file(path)?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
 }
 struct Trip {
     phase: TripPhase,
@@ -206,6 +276,34 @@ struct Trip {
     empty_scans: u32,
 }
 impl Trip {
+    fn save_mine_resume(&self, runtime: &std::path::Path, state: &State) -> Result<()> {
+        let mine = state.home.mine.ok_or_else(|| {
+            pause("Mine point is missing; set /flyminer mine set or use miner mine to mine here")
+        })?;
+        atomic_json(
+            &runtime.join("resume-mine.json"),
+            &MineResume {
+                session: state.session_key(),
+                home_revision: state.home.revision,
+                request: self.request,
+                mine,
+            },
+        )
+    }
+    fn reconfigure(self, runtime: &std::path::Path, state: &State) -> Result<Option<Self>> {
+        if state.home.home.is_none() {
+            MineResume::clear_for_session(runtime, state)?;
+            return Ok(None);
+        }
+        // Waypoint/radius edits invalidate geometry, not the purpose of the trip.
+        // Only a new, unacknowledged home request redirects a mine trip home.
+        let mut trip = Self::new(state);
+        if self.phase == TripPhase::Mine && state.home.request <= state.home.acknowledged {
+            trip.phase = TripPhase::Mine;
+            trip.save_mine_resume(runtime, state)?;
+        }
+        Ok(Some(trip))
+    }
     fn resume(runtime: &std::path::Path, state: &State) -> Result<Option<Self>> {
         let path = runtime.join("resume-mine.json");
         if !path.exists() {
@@ -248,7 +346,7 @@ impl Trip {
         map: &mut World,
         atlas: &mut Atlas,
     ) -> Result<TripStep> {
-        let here = state.position.cell();
+        let here = state.feet();
         let returning = self.phase == TripPhase::Home;
         let home = state
             .home
@@ -390,7 +488,8 @@ impl Trip {
             let stocked = after.has("pickaxe")
                 && after.has("food")
                 && after.target_harvestable != Some(false)
-                && after.reserve_pickaxe();
+                && after.reserve_pickaxe()
+                && (!crate::nether::active(&after) || after.has("torch"));
             if navigation::cargo(&after) || after.free_slots == 0 || !stocked {
                 status(
                     bridge,
@@ -415,17 +514,7 @@ impl Trip {
                 ));
             }
             self.phase = TripPhase::Mine;
-            if let Some(mine) = after.home.mine {
-                atomic_json(
-                    &bridge.runtime.join("resume-mine.json"),
-                    &MineResume {
-                        session: after.session_key(),
-                        home_revision: after.home.revision,
-                        request: self.request,
-                        mine,
-                    },
-                )?;
-            }
+            self.save_mine_resume(&bridge.runtime, &after)?;
             self.denied.clear();
             self.visits.clear();
             self.empty_scans = 0;
@@ -446,13 +535,22 @@ impl Trip {
                 if self.empty_scans < 2 {
                     return Ok(TripStep::Refresh);
                 }
-                return Err(pause(if !state.has("pickaxe") {
-                    "No safe checked passage to destination; no usable pickaxe, so digging is unavailable"
-                } else if !can_dig {
-                    "No safe checked passage to destination; digging is paused until health reaches 18"
-                } else {
-                    "No safe checked route after rescanning; a pickaxe is available. Check for a connected entrance, protected blocks, or the two-block liquid/unknown buffer"
-                }));
+                idle_retry(
+                    bridge,
+                    board,
+                    if !state.has("pickaxe") {
+                        "No safe checked passage to destination; no usable pickaxe, so digging is unavailable"
+                    } else if !can_dig {
+                        "No safe checked passage to destination; digging is paused until health reaches 18"
+                    } else {
+                        "No safe checked route after rescanning; a pickaxe is available. Check for a connected entrance, protected blocks, or the two-block liquid/unknown buffer"
+                    },
+                )?;
+                if self.empty_scans.is_multiple_of(10) {
+                    self.denied.clear();
+                    self.visits.clear();
+                }
+                return Ok(TripStep::Refresh);
             };
             self.empty_scans = 0;
             if route.path.is_empty() {
@@ -465,9 +563,13 @@ impl Trip {
                 .ok_or_else(|| pause("Empty travel route"))?;
             *self.visits.entry(end).or_default() += 1;
             if self.visits[&end] > 3 {
-                return Err(pause(
-                    "Return route is not progressing; open a connected entrance and restart",
-                ));
+                self.denied.insert(end);
+                idle_retry(
+                    bridge,
+                    board,
+                    "Travel endpoint is not progressing; checking another route",
+                )?;
+                return Ok(TripStep::Refresh);
             }
             status(
                 bridge,
@@ -494,9 +596,12 @@ impl Trip {
             self.path.clear();
             self.failures += 1;
             if self.failures >= 12 {
-                return Err(pause(
-                    "Route changed repeatedly; return paused on supported ground",
-                ));
+                self.failures = 0;
+                idle_retry(
+                    bridge,
+                    board,
+                    "Route changed repeatedly; rescanning before the next detour",
+                )?;
             }
             return Ok(TripStep::Refresh);
         }
@@ -537,7 +642,7 @@ impl Trip {
                     atlas.put(p, b)?;
                 }
             } else {
-                if let Some(end) = self.path.iter().position(|p| *p == after.position.cell()) {
+                if let Some(end) = self.path.iter().position(|p| *p == after.feet()) {
                     self.path.drain(..=end);
                 } else {
                     self.path.clear();
@@ -558,9 +663,12 @@ impl Trip {
             self.path.clear();
             self.failures += 1;
             if self.failures >= 12 {
-                return Err(pause(
-                    "Repeated movement failure on return route; inspect actions.jsonl",
-                ));
+                self.failures = 0;
+                idle_retry(
+                    bridge,
+                    board,
+                    "Movement blocked; checking alternative travel routes",
+                )?;
             }
             return Ok(TripStep::Refresh);
         }
@@ -573,23 +681,117 @@ enum TripStep {
     Finished,
 }
 
-pub fn run(bridge: &mut Bridge) -> Result<()> {
+fn start_trip(
+    bridge: &mut Bridge,
+    board: &mut Scoreboard,
+    state: &mut State,
+    mode: StartMode,
+) -> Result<Option<Trip>> {
+    if mode == StartMode::Resume {
+        if state.home.request > state.home.acknowledged {
+            println!(
+                "Pending home request: {:.0}s old. run resumes it; use miner mine to cancel it and mine here, or miner mine --waypoint to go to the saved mine.",
+                now().saturating_sub(state.home.request) as f64 / 1000.
+            );
+        }
+        return Trip::resume(&bridge.runtime, state);
+    }
+    if mode == StartMode::MineWaypoint && (state.home.home.is_none() || state.home.mine.is_none()) {
+        bail!(
+            "Set /flyminer home set and /flyminer mine set first, or use miner mine to mine here"
+        );
+    }
+    if state.home.request > state.home.acknowledged {
+        let request = state.home.request;
+        let (ok, after) = action(
+            bridge,
+            board,
+            json!({"action":"home_ack","request":request}),
+        )?;
+        if !ok || after.home.request != request || after.home.acknowledged != request {
+            return Err(pause(
+                "Home request changed or cancellation failed; inspect status and retry",
+            ));
+        }
+        *state = after;
+    }
+    MineResume::clear_for_session(&bridge.runtime, state)?;
+    if mode == StartMode::MineWaypoint {
+        let mut trip = Trip::new(state);
+        trip.phase = TripPhase::Mine;
+        trip.save_mine_resume(&bridge.runtime, state)?;
+        return Ok(Some(trip));
+    }
+    status(
+        bridge,
+        board,
+        "mine",
+        "Old trip cancelled; mining here. Home protection and automatic supply returns remain active",
+    )?;
+    Ok(None)
+}
+
+fn await_ready(bridge: &Bridge) -> Result<Option<State>> {
+    let mut waiting = false;
+    loop {
+        if bridge.stopped() {
+            return Ok(None);
+        }
+        let state = bridge.state()?;
+        crate::bridge::require_enabled(&state)?;
+        if !state.screen_open {
+            return Ok(Some(state));
+        }
+        if !waiting {
+            println!(
+                "menu: FlyMiner is enabled on {}; close chat/Esc/inventory and return to the game to start. Ctrl+C cancels",
+                state.server
+            );
+            waiting = true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub fn run(bridge: &mut Bridge, mode: StartMode) -> Result<()> {
     let _lock = bridge.lock()?;
     if bridge.runtime.join("stop-request.json").exists() {
         fs::remove_file(bridge.runtime.join("stop-request.json"))?;
     }
-    let mut state = bridge.state()?;
-    if !state.enabled || !state.expected_session || state.screen_open {
-        bail!("Open a world or join the server, /flyminer enable, then close the menu");
-    }
+    println!("Bridge folder: {}", bridge.dir.display());
+    let Some(mut state) = await_ready(bridge)? else {
+        return Ok(());
+    };
+    println!(
+        "Connected: {} as {} (Bridge {}; control enabled)",
+        state.server, state.username, state.bridge_version
+    );
     if state.action != "idle" {
         bail!("Bridge is busy; stop the other controller first");
+    }
+    if crate::nether::active(&state)
+        && (!state.capabilities.iter().any(|c| c == "nether_mining")
+            || !state.capabilities.iter().any(|c| c == "fractional_floor"))
+    {
+        bail!(
+            "Nether mining requires Bridge 0.10.1 (Soul Sand movement fix); close Minecraft and install the new bridge first"
+        );
+    }
+    if let Some(y) = crate::nether::exploration_y(&state) {
+        println!(
+            "Nether: covered mining routes; exploration near Y={y}; rear trail torches about every 6 blocks; home stays in this dimension"
+        );
+    }
+    if !state.capabilities.iter().any(|c| c == "rear_torches") {
+        println!(
+            "Bridge 0.8.0 is needed for rear torch placement and automatic hazard retreat; older bridges skip torch placement."
+        );
     }
     let mut board = Scoreboard {
         started_at: now(),
         health: state.health,
         food: state.food,
-        position: state.position.cell(),
+        position: state.feet(),
         world: state.server.clone(),
         ..Scoreboard::default()
     };
@@ -610,27 +812,35 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
     let mut atlas = Atlas::load(&bridge.runtime, &state)?;
     let session = state.session_key();
     let result = (|| -> Result<()> {
+        // Brain/atlas loading can take time; never act on the startup snapshot.
+        state = bridge.state()?;
+        if state.session_key() != session {
+            return Err(Cancelled("World/session changed while starting").into());
+        }
         let mut world: Option<World> = None;
-        let mut scan_center = state.position.cell();
+        let mut scan_center = state.feet();
         let mut scanned = Instant::now();
         let mut visited = HashMap::<Pos, u32>::new();
         let mut denied = HashMap::<Pos, Instant>::new();
+        let mut route_failures = RouteFailures::default();
         let mut last_cell = None;
         let mut goal_key = state.goal_key();
         let mut health = state.health;
         let mut torch_at: Option<Pos> = None;
         let mut torch_attempt = Instant::now() - Duration::from_secs(60);
+        let mut torch_retry = Duration::from_secs(8);
+        let mut escape_attempt = Instant::now() - Duration::from_secs(60);
         let mut equipped = false;
         let mut combat_since: Option<Instant> = None;
         let mut no_plan = 0;
         let mut recovery: Option<(f64, Instant)> = None;
-        let mut trip = Trip::resume(&bridge.runtime, &state)?;
+        let mut trip = start_trip(bridge, &mut board, &mut state, mode)?;
         if trip.is_some() {
             status(
                 bridge,
                 &mut board,
                 "return_to_mine",
-                "Resuming the stored return to your mine point",
+                "Travelling to the configured mine point before continuous mining",
             )?;
         }
         let mut home_revision = state.home.revision;
@@ -651,7 +861,7 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
             }
             board.health = state.health;
             board.food = state.food;
-            board.position = state.position.cell();
+            board.position = state.feet();
             board.world = state.server.clone();
             if let Some(a) = &mut attempt {
                 a.damage += (health - state.health).max(0.);
@@ -692,12 +902,37 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                     t.path.clear();
                 }
             }
+            if state.oxygen.needs_escape {
+                finish(bridge, &mut book, &mut attempt, false, &mut board)?;
+                world = None;
+                if let Some(t) = &mut trip {
+                    t.path.clear();
+                }
+                equipped = false;
+                if !state.capabilities.iter().any(|c| c == "oxygen_escape") {
+                    return Err(pause(
+                        "Low oxygen; install a bridge with oxygen escape before continuing",
+                    ));
+                }
+                status(
+                    bridge,
+                    &mut board,
+                    "oxygen",
+                    "Low oxygen: finding breathable air before resuming work",
+                )?;
+                let (ok, _) = action(bridge, &mut board, json!({"action":"breathe"}))?;
+                if !ok {
+                    thread::sleep(Duration::from_millis(150));
+                }
+                continue;
+            }
             if state.goal_key() != goal_key {
                 focus = None;
                 attempt = None;
                 world = None;
                 denied.clear();
                 goal_key = state.goal_key();
+                route_failures = RouteFailures::default();
                 equipped = false;
                 recovery = None;
             }
@@ -713,8 +948,8 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                 } else {
                     attempt = None;
                 }
-                if trip.is_some() {
-                    trip = state.home.home.map(|_| Trip::new(&state));
+                if let Some(current) = trip.take() {
+                    trip = current.reconfigure(&bridge.runtime, &state)?;
                 }
             }
             if state.home.home.is_some()
@@ -724,6 +959,7 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                     && state.free_slots >= 2
                     && !craft_failed
                     && state.has("food")
+                    && (!crate::nether::active(&state) || state.has("torch"))
                     && state.home.request <= state.home.acknowledged)
             {
                 if attempt.as_ref().is_some_and(|a| a.points > 0.) {
@@ -746,24 +982,92 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                 focus = None; // Supplies/manual home requests preempt mining commitments.
                 status(bridge, &mut board, "home", reason)?;
             }
-            let cell = state.position.cell();
+            let cell = state.feet();
             if last_cell != Some(cell) {
                 *visited.entry(cell).or_default() += 1;
                 last_cell = Some(cell);
             }
-            if state.in_lava || state.in_water {
-                finish(bridge, &mut book, &mut attempt, true, &mut board)?;
-                bail!("Player entered liquid; stopped for manual recovery");
+            if crate::nether::interrupts_work(&state) {
+                finish(bridge, &mut book, &mut attempt, false, &mut board)?;
+                world = None;
+                if let Some(t) = &mut trip {
+                    t.path.clear();
+                }
+                if escape_attempt.elapsed() >= Duration::from_secs(1) {
+                    escape_attempt = Instant::now();
+                    status(
+                        bridge,
+                        &mut board,
+                        "retreat",
+                        "Nether danger: retreating on checked ground away from ranged mobs or piglins",
+                    )?;
+                    let (ok, _) = action(
+                        bridge,
+                        &mut board,
+                        json!({"action":"escape","travel":true,"avoidThreats":true}),
+                    )?;
+                    if ok {
+                        continue;
+                    }
+                }
+                if state.food < 18 && state.has("food") {
+                    action(bridge, &mut board, json!({"action":"eat"}))?;
+                    equipped = false;
+                }
+                idle_retry(
+                    bridge,
+                    &mut board,
+                    "Nether danger: no checked retreat; waiting for danger to clear",
+                )?;
+                continue;
             }
-            if state.liquid_safe == Some(false) {
-                return Err(pause(
-                    "Water/lava or unknown terrain within the two-block body buffer; move to safe dry ground and restart",
-                ));
+            // Defend in-place against an enemy already in melee range before
+            // attempting a retreat whose corridor would reject that enemy.
+            if (state.in_lava || state.in_water || state.liquid_safe == Some(false))
+                && !state
+                    .hostiles
+                    .iter()
+                    .any(|e| !e.avoid_only && e.visible && e.reach_distance() <= 3.)
+            {
+                if attempt.is_some() {
+                    finish(bridge, &mut book, &mut attempt, false, &mut board)?;
+                }
+                world = None;
+                if let Some(t) = &mut trip {
+                    t.path.clear();
+                }
+                if state.capabilities.iter().any(|c| c == "hazard_recovery")
+                    && escape_attempt.elapsed() >= Duration::from_secs(3)
+                {
+                    escape_attempt = Instant::now();
+                    status(
+                        bridge,
+                        &mut board,
+                        "retreat",
+                        "Finding supported dry ground away from the fluid buffer",
+                    )?;
+                    let (ok, _) =
+                        action(bridge, &mut board, json!({"action":"escape","travel":true}))?;
+                    if ok {
+                        continue;
+                    }
+                }
+                if state.food < 18 && state.has("food") {
+                    action(bridge, &mut board, json!({"action":"eat"}))?;
+                    equipped = false;
+                    continue;
+                }
+                idle_retry(
+                    bridge,
+                    &mut board,
+                    "No checked dry escape yet; holding position and retrying (hazard recovery needs Bridge 0.8.0)",
+                )?;
+                continue;
             }
             let threats: Vec<_> = state
                 .hostiles
                 .iter()
-                .filter(|e| e.visible && e.reach_distance() < 4.5)
+                .filter(|e| !e.avoid_only && e.visible && e.reach_distance() < 4.5)
                 .collect();
             if !threats.is_empty() {
                 let since = combat_since.get_or_insert_with(Instant::now);
@@ -846,6 +1150,11 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                 world = None;
                 equipped = false;
             }
+            if crate::nether::active(&state) && !state.has("torch") && trip.is_none() {
+                return Err(pause(
+                    "Nether trail torches exhausted; refill torches or set a home chest in this dimension",
+                ));
+            }
             // With no nearby visible threat, restore food and wait for healing even at low HP.
             // Mining/traversal still require HP >= 18 in both Rust and the Forge bridge.
             if state.food < 18 || (state.health < 18. && state.food < 20) {
@@ -871,6 +1180,26 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                     equipped = false;
                     continue;
                 }
+            }
+            if state.mining_profile.requires_cover && !state.mining_profile.under_cover {
+                if attempt.as_ref().is_some_and(|a| a.points > 0.) {
+                    finish(bridge, &mut book, &mut attempt, false, &mut board)?;
+                } else {
+                    attempt = None;
+                }
+                world = None;
+                if let Some(t) = &mut trip {
+                    t.path.clear();
+                }
+                equipped = false;
+                status(
+                    bridge,
+                    &mut board,
+                    "shelter",
+                    "Dwarf profile: move under a roof or into a tunnel; mining and home routes require continuous cover",
+                )?;
+                thread::sleep(Duration::from_millis(250));
+                continue;
             }
             if state.health <= 8. && trip.is_some() && !state.has("food") {
                 return Err(pause(
@@ -972,9 +1301,25 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
             }
             if !state.navigation.origin_safe || !state.navigation.centered {
                 if state.navigation.anchor.is_none() {
-                    return Err(pause(
-                        "No supported standing anchor nearby; move onto a solid block and run again",
-                    ));
+                    if state.capabilities.iter().any(|c| c == "hazard_recovery")
+                        && escape_attempt.elapsed() >= Duration::from_secs(3)
+                    {
+                        escape_attempt = Instant::now();
+                        let (ok, _) =
+                            action(bridge, &mut board, json!({"action":"escape","travel":true}))?;
+                        if ok {
+                            world = None;
+                            attempt = None;
+                            continue;
+                        }
+                    }
+                    idle_retry(
+                        bridge,
+                        &mut board,
+                        "Checking for a supported way off this edge; no blind drops",
+                    )?;
+                    world = None;
+                    continue;
                 }
                 status(
                     bridge,
@@ -997,11 +1342,15 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                     {
                         continue;
                     }
-                    return Err(pause(
-                        "Could not center safely; move onto solid ground and run again",
-                    ));
+                    idle_retry(
+                        bridge,
+                        &mut board,
+                        "Standing geometry changed; checking another safe anchor",
+                    )?;
+                    world = None;
+                    continue;
                 }
-                if after.position.cell() != cell {
+                if after.feet() != cell {
                     if attempt.as_ref().is_some_and(|a| a.points > 0.) {
                         finish(bridge, &mut book, &mut attempt, false, &mut board)?;
                     } else {
@@ -1011,30 +1360,10 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                 }
                 continue;
             }
-            if trip.is_none()
-                && state.light_level <= 6
-                && torch_attempt.elapsed() > Duration::from_secs(8)
-                && torch_at.is_none_or(|p| p.distance(cell) >= 4.)
+            if !state.capabilities.iter().any(|c| c == "block_tools")
+                && state.has("pickaxe")
+                && (!equipped || !state.holds("pickaxe"))
             {
-                torch_attempt = Instant::now();
-                if state.has("torch") {
-                    status(
-                        bridge,
-                        &mut board,
-                        "torch",
-                        "Dark area: placing a torch at a random checked spot",
-                    )?;
-                    let (ok, _) = action(bridge, &mut board, json!({"action":"torch"}))?;
-                    if ok {
-                        torch_at = Some(cell);
-                    }
-                    equipped = false;
-                    continue;
-                } else {
-                    println!("No torches left; mining continues without placing lights.");
-                }
-            }
-            if state.has("pickaxe") && (!equipped || !state.holds("pickaxe")) {
                 let (_, after) = action(
                     bridge,
                     &mut board,
@@ -1083,7 +1412,7 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                 if state.home.home.is_some() {
                     atlas.save(&bridge.runtime)?;
                 }
-                scan_center = after.position.cell();
+                scan_center = after.feet();
                 scanned = Instant::now();
                 state = after;
                 fresh_scan = true;
@@ -1168,12 +1497,32 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                 let next = book.choose(candidates, &state);
                 let Some(plan) = next else {
                     no_plan += 1;
-                    if no_plan >= 3 {
-                        return Err(pause(if focus.is_some() {
-                            "Locked target vein still has ore, but no safe reachable member remains; check liquids, protected terrain or blocked access"
+                    if no_plan >= 2 {
+                        if let Some(locked) = focus.take() {
+                            for p in locked.pending() {
+                                denied.insert(p, Instant::now() + Duration::from_secs(90));
+                            }
+                            status(
+                                bridge,
+                                &mut board,
+                                "detour",
+                                "Vein temporarily inaccessible; trying other ore or a safe detour, then retrying it later",
+                            )?;
+                            no_plan = 0;
                         } else {
-                            "No safe target vein or descending/detour route with two-block liquid clearance; relocate and run again"
-                        }));
+                            if no_plan % 10 == 0 {
+                                visited.clear();
+                            }
+                            idle_retry(
+                                bridge,
+                                &mut board,
+                                if crate::nether::active(&state) {
+                                    "No checked covered Nether route; looking for a dry tunnel entrance away from lava and ranged mobs"
+                                } else {
+                                    "No checked mining route yet; rescanning for a dry detour or staircase"
+                                },
+                            )?;
+                        }
                     }
                     world = None;
                     thread::sleep(Duration::from_millis(300));
@@ -1268,6 +1617,7 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                                 json!({"action":"traverse","x":to.x,"y":to.y,"z":to.z}),
                             )?;
                             if ok {
+                                route_failures.reached(to);
                                 if let Some(a) = &mut attempt {
                                     a.moves += 1;
                                 }
@@ -1283,7 +1633,14 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                                 }
                                 world = None;
                             } else {
-                                denied.insert(to, Instant::now() + Duration::from_secs(10));
+                                let until = route_failures.reject(to, Instant::now());
+                                denied.insert(to, until);
+                                status(
+                                    bridge,
+                                    &mut board,
+                                    "detour",
+                                    "Walking route failed; excluding that destination while checking another path",
+                                )?;
                                 finish(bridge, &mut book, &mut attempt, true, &mut board)?;
                                 world = None;
                             }
@@ -1310,6 +1667,31 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                     continue;
                 }
             };
+            if crate::lighting::due(&state, torch_at)
+                && torch_attempt.elapsed() > torch_retry
+                && let Some(a) = &attempt
+                && let Some(command) = crate::lighting::command(
+                    &state,
+                    &a.plan,
+                    focus.as_ref(),
+                    dig.as_ref().map(|d| d.0),
+                )
+            {
+                torch_attempt = Instant::now();
+                status(
+                    bridge,
+                    &mut board,
+                    "torch",
+                    "Placing a torch behind the digging direction, outside planned cuts",
+                )?;
+                let (ok, _) = action(bridge, &mut board, command)?;
+                torch_retry = Duration::from_secs(if ok { 8 } else { 30 });
+                if ok {
+                    torch_at = Some(cell);
+                }
+                equipped = false;
+                continue;
+            }
             if let Some((pos, block, ore)) = dig {
                 let (ok, after) = action(
                     bridge,
@@ -1356,7 +1738,16 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
                         world = None;
                         continue;
                     }
-                    denied.insert(pos, Instant::now() + Duration::from_secs(30));
+                    let obstructed = after
+                        .last_result
+                        .message
+                        .contains("hidden behind another block");
+                    // Retry the same ore from a different standing point. Occlusion
+                    // says nothing about whether the ore itself is unreachable.
+                    denied.insert(
+                        if obstructed { cell } else { pos },
+                        Instant::now() + Duration::from_secs(30),
+                    );
                     finish(bridge, &mut book, &mut attempt, true, &mut board)?;
                     world = None;
                 }
@@ -1398,6 +1789,90 @@ pub fn run(bridge: &mut Bridge) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_waits_for_enabled_menu_to_close_without_publishing_actions() {
+        let root = std::env::temp_dir().join(format!("miner-start-menu-{}", now()));
+        let dir = root.join("config/flyminer");
+        fs::create_dir_all(&dir).expect("dir");
+        let mut state = State {
+            protocol: 8,
+            updated_at: now(),
+            enabled: true,
+            expected_session: true,
+            screen_open: true,
+            server: "new.example:27920".into(),
+            ..Default::default()
+        };
+        atomic_json(&dir.join("state.json"), &state).expect("state");
+        let mut bridge = Bridge::new(root.clone(), root.join("runtime")).expect("bridge");
+        bridge.deadline = Some(Instant::now() + Duration::from_secs(3));
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            assert!(
+                !dir.join("command.json").exists(),
+                "Menu waiting must not control the character"
+            );
+            state.screen_open = false;
+            state.updated_at = now();
+            atomic_json(&dir.join("state.json"), &state).expect("close menu");
+        });
+        let ready = await_ready(&bridge)
+            .expect("enabled menu is not an error")
+            .expect("ready");
+        worker.join().expect("worker");
+        assert!(ready.enabled && !ready.screen_open);
+        assert_eq!(ready.server, "new.example:27920");
+        assert!(!bridge.dir.join("command.json").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn startup_menu_wait_can_be_cancelled_without_enabling_or_moving() {
+        let root = std::env::temp_dir().join(format!("miner-cancel-menu-{}", now()));
+        let dir = root.join("config/flyminer");
+        fs::create_dir_all(&dir).expect("dir");
+        let state = State {
+            protocol: 8,
+            updated_at: now(),
+            enabled: true,
+            expected_session: true,
+            screen_open: true,
+            ..Default::default()
+        };
+        atomic_json(&dir.join("state.json"), &state).expect("state");
+        let mut bridge = Bridge::new(root.clone(), root.join("runtime")).expect("bridge");
+        bridge.deadline = Some(Instant::now() + Duration::from_millis(100));
+        assert!(await_ready(&bridge).expect("cancel").is_none());
+        assert!(!dir.join("command.json").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn failed_walking_cells_back_off_then_reset_after_verified_success() {
+        let mut failures = RouteFailures::default();
+        let p = Pos {
+            x: 67,
+            y: 112,
+            z: -6,
+        };
+        let now = Instant::now();
+        for (step, seconds) in [30, 60, 120, 120].into_iter().enumerate() {
+            let at = now + Duration::from_secs(step as u64 * 130);
+            assert_eq!(
+                failures.reject(p, at).duration_since(at),
+                Duration::from_secs(seconds)
+            );
+        }
+        failures.reached(p);
+        let at = now + Duration::from_secs(520);
+        assert_eq!(
+            failures.reject(p, at).duration_since(at),
+            Duration::from_secs(30)
+        );
+        let at = now + Duration::from_secs(1200);
+        assert_eq!(
+            failures.reject(p, at).duration_since(at),
+            Duration::from_secs(30)
+        );
+    }
     use crate::types::{Enemy, LocalBlock, Outcome, Stack};
     use std::sync::{
         Arc,
@@ -1439,23 +1914,129 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[test]
+    fn waypoint_edits_preserve_mine_phase_and_restart_checkpoint_but_new_home_preempts() {
+        let root = std::env::temp_dir().join(format!("miner-retarget-{}", now()));
+        fs::create_dir_all(&root).expect("directory");
+        let (_, mut state) = crate::planner::tests::fixture();
+        state.home.home = Some(Pos { x: 6, y: 1, z: 3 });
+        state.home.mine = Some(Pos { x: 3, y: 1, z: 3 });
+        state.home.request = 10;
+        state.home.acknowledged = 10;
+        let mut trip = Trip::new(&state);
+        trip.phase = TripPhase::Mine;
+        trip.path.push(Pos { x: 5, y: 1, z: 3 });
+        state.home.mine = Some(Pos { x: 4, y: 1, z: 3 });
+        state.home.radius = 2;
+        state.home.revision += 1;
+        let trip = trip
+            .reconfigure(&root, &state)
+            .expect("replan")
+            .expect("trip");
+        assert_eq!(trip.phase, TripPhase::Mine);
+        assert!(trip.path.is_empty());
+        assert_eq!(
+            Trip::resume(&root, &state)
+                .expect("restart")
+                .expect("saved")
+                .phase,
+            TripPhase::Mine
+        );
+        state.home.request = 11;
+        state.home.revision += 1;
+        let trip = trip
+            .reconfigure(&root, &state)
+            .expect("new request")
+            .expect("trip");
+        assert_eq!(trip.phase, TripPhase::Home);
+        assert_eq!(trip.request, 11);
+        assert!(
+            Trip::resume(&root, &state)
+                .expect("old checkpoint")
+                .is_none()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Scenario {
+        Dwarf,
+        BlockTools,
+        Oxygen,
         Normal,
         Edge,
         FullAfterOre,
         Craft,
         Unknown,
         Focus,
+        BlockedFocus,
+        LiquidBuffer,
+        LiquidCombat,
+        TorchSkipped,
+        NetherThreat,
     }
 
+    #[test]
+    fn dwarf_eats_while_exposed_then_resumes_only_after_shelter() {
+        exercise_loop(20., 10, Scenario::Dwarf);
+    }
+    #[test]
+    fn block_tool_bridge_keeps_control_of_equipment_between_digs() {
+        exercise_loop(20., 20, Scenario::BlockTools);
+    }
     #[test]
     fn continuous_ipc_survives_combat_food_and_darkness_without_waiting_for_drops() {
         exercise_loop(20., 20, Scenario::Normal);
     }
     #[test]
+    fn underground_oxygen_escape_preempts_mining_and_then_resumes() {
+        exercise_loop(20., 20, Scenario::Oxygen);
+    }
+    #[test]
     fn vein_lock_survives_reward_updates_and_combat_without_grabbing_other_exposed_ore() {
         exercise_loop(20., 20, Scenario::Focus);
+    }
+    #[test]
+    fn blocked_vein_is_deferred_and_other_ore_is_mined_without_exiting() {
+        exercise_loop(20., 20, Scenario::BlockedFocus);
+    }
+    #[test]
+    fn unsafe_liquid_buffer_retreats_before_resuming_mining() {
+        exercise_loop(20., 20, Scenario::LiquidBuffer);
+    }
+    #[test]
+    fn melee_defense_remains_active_while_waiting_for_a_hazard_retreat() {
+        exercise_loop(20., 20, Scenario::LiquidCombat);
+    }
+    #[test]
+    fn missing_rear_torch_support_backs_off_and_keeps_mining() {
+        exercise_loop(20., 20, Scenario::TorchSkipped);
+    }
+    #[test]
+    fn nether_retreats_before_work_and_places_a_rear_torch_even_in_bright_light() {
+        exercise_loop(20., 20, Scenario::NetherThreat);
+    }
+    #[test]
+    fn old_bridge_cannot_begin_nether_control_or_publish_actions() {
+        let root = std::env::temp_dir().join(format!("miner-nether-version-{}", now()));
+        let dir = root.join("config/flyminer");
+        fs::create_dir_all(&dir).expect("directory");
+        let state = State {
+            dimension: crate::nether::DIMENSION.into(),
+            protocol: 8,
+            enabled: true,
+            expected_session: true,
+            action: "idle".into(),
+            health: 20.,
+            updated_at: now(),
+            ..Default::default()
+        };
+        atomic_json(&dir.join("state.json"), &state).expect("state");
+        let mut bridge = Bridge::new(root.clone(), root.join("runtime")).expect("bridge");
+        let error = run(&mut bridge, StartMode::Resume).expect_err("old bridge must be rejected");
+        assert!(error.to_string().contains("Bridge 0.10.1"), "{error:#}");
+        assert!(!dir.join("command.json").exists());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1487,7 +2068,12 @@ mod tests {
         Manual,
         NoPickaxe,
         NoFood,
+        NoNetherTorches,
         EmptyChest,
+        CancelHere,
+        CancelWaypoint,
+        RejectCancel,
+        RetargetMine,
     }
     #[test]
     fn full_inventory_deposits_keeps_supplies_returns_to_mine_and_resumes() {
@@ -1506,8 +2092,28 @@ mod tests {
         exercise_home(HomeCase::NoFood);
     }
     #[test]
+    fn nether_torch_exhaustion_returns_restocks_and_resumes_mining() {
+        exercise_home(HomeCase::NoNetherTorches);
+    }
+    #[test]
     fn insufficient_chest_supplies_pause_at_home_without_mining() {
         exercise_home(HomeCase::EmptyChest);
+    }
+    #[test]
+    fn mine_here_cancels_stale_home_and_checkpoint_then_honors_a_new_home_request() {
+        exercise_home(HomeCase::CancelHere);
+    }
+    #[test]
+    fn mine_waypoint_bypasses_storage_and_starts_at_the_saved_mine() {
+        exercise_home(HomeCase::CancelWaypoint);
+    }
+    #[test]
+    fn failed_home_cancellation_does_not_start_mining_or_clear_checkpoint() {
+        exercise_home(HomeCase::RejectCancel);
+    }
+    #[test]
+    fn editing_mine_after_storage_does_not_send_player_home_again() {
+        exercise_home(HomeCase::RetargetMine);
     }
 
     fn exercise_home(case: HomeCase) {
@@ -1517,7 +2123,7 @@ mod tests {
         fs::create_dir_all(&directory).expect("dir");
         let (mut world, mut state) = crate::planner::tests::fixture();
         let home = Pos { x: 6, y: 1, z: 3 };
-        let mine = state.position.cell();
+        let mine = state.feet();
         let chest = Pos { x: 6, y: 1, z: 4 };
         state.home.home = Some(home);
         state.home.mine = Some(mine);
@@ -1530,7 +2136,11 @@ mod tests {
         state.health = 20.;
         state.food = 20;
         state.light_level = 15;
-        state.free_slots = if case == HomeCase::Full { 0 } else { 1 };
+        state.free_slots = if matches!(case, HomeCase::Full | HomeCase::RetargetMine) {
+            0
+        } else {
+            1
+        };
         state.navigation.origin_safe = true;
         state.navigation.centered = true;
         let supplies = vec![
@@ -1562,6 +2172,12 @@ mod tests {
             },
         ];
         state.inventory = supplies.clone();
+        if case == HomeCase::NoNetherTorches {
+            state.dimension = crate::nether::DIMENSION.into();
+            world.scan.dimension = state.dimension.clone();
+            state.capabilities = vec!["nether_mining".into(), "fractional_floor".into()];
+            state.inventory.retain(|s| !s.torch);
+        }
         if matches!(case, HomeCase::NoPickaxe | HomeCase::EmptyChest) {
             state.inventory.retain(|s| !s.pickaxe);
         }
@@ -1593,6 +2209,28 @@ mod tests {
             });
         }
         world.scan.chests = vec![chest];
+        let explicit_mine = matches!(
+            case,
+            HomeCase::CancelHere | HomeCase::CancelWaypoint | HomeCase::RejectCancel
+        );
+        if explicit_mine {
+            state.home.request = 10;
+            state.home.acknowledged = 9;
+            fs::create_dir_all(root.join("runtime")).expect("runtime");
+            atomic_json(
+                &root.join("runtime/resume-mine.json"),
+                &MineResume {
+                    session: state.session_key(),
+                    home_revision: 0,
+                    request: 9,
+                    mine: home, // An obsolete checkpoint must not send mine-here back home.
+                },
+            )
+            .expect("old checkpoint");
+        }
+        if case == HomeCase::CancelWaypoint {
+            state.position.x = f64::from(home.x) + 0.5;
+        }
         state.updated_at = now();
         atomic_json(&directory.join("state.json"), &state).expect("state");
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1615,8 +2253,19 @@ mod tests {
                     let id = command["id"].as_str().expect("id").to_string();
                     let mut status = "done";
                     match name {
-                        "home_request" => state.home.request = 1,
-                        "home_ack" => state.home.acknowledged = state.home.request,
+                        "home_request" => state.home.request += 1,
+                        "home_ack" => {
+                            assert_eq!(command["request"].as_u64(), Some(state.home.request));
+                            if case == HomeCase::RejectCancel {
+                                status = "failed";
+                            } else {
+                                state.home.acknowledged = state.home.request;
+                            }
+                            if case == HomeCase::RetargetMine {
+                                state.home.mine = Some(Pos { x: 4, y: 1, z: 3 });
+                                state.home.revision += 1;
+                            }
+                        }
                         "scan" => {
                             world.scan.id = id.clone();
                             world.scan.updated_at = now();
@@ -1638,7 +2287,7 @@ mod tests {
                                     navigation::travel_cost(
                                         &|p| world.get(p),
                                         &state.home,
-                                        state.position.cell(),
+                                        state.feet(),
                                         to,
                                         false
                                     )
@@ -1656,7 +2305,7 @@ mod tests {
                             }
                         }
                         "store" => {
-                            assert!(state.position.cell().distance(chest) <= 1.5);
+                            assert!(state.feet().distance(chest) <= 1.5);
                             state.screen_open = true;
                             state.container_owned = true;
                             state.action = "store".into();
@@ -1666,15 +2315,28 @@ mod tests {
                         }
                         "mine" => {
                             if !stored {
-                                assert_eq!(
-                                    case,
-                                    HomeCase::Manual,
+                                assert!(
+                                    matches!(
+                                        case,
+                                        HomeCase::Manual
+                                            | HomeCase::CancelHere
+                                            | HomeCase::CancelWaypoint
+                                    ),
                                     "must store/refill before mining"
                                 );
+                                if explicit_mine {
+                                    assert_eq!(state.home.request, state.home.acknowledged);
+                                    assert_eq!(state.feet(), mine);
+                                    assert_eq!(state.home.home, Some(home));
+                                    assert_eq!(state.home.radius, 1);
+                                }
+                                if case == HomeCase::CancelWaypoint {
+                                    resumed = true;
+                                }
                             } else {
                                 assert_eq!(
-                                    state.position.cell(),
-                                    mine,
+                                    Some(state.feet()),
+                                    state.home.mine,
                                     "must return to configured point first"
                                 );
                                 resumed = true;
@@ -1688,10 +2350,11 @@ mod tests {
                             state.navigation.ores.retain(|b| b.pos != p);
                             let i = world.index(p).expect("mined cell");
                             world.scan.cells[i] = 1;
-                            if case == HomeCase::Manual && !triggered {
+                            if matches!(case, HomeCase::Manual | HomeCase::CancelHere) && !triggered
+                            {
                                 triggered = true;
-                                state.home.request = 1;
-                                state.home.revision = 1;
+                                state.home.request += 1;
+                                state.home.revision += 1;
                                 state.screen_open = true;
                                 chat_ticks = 20;
                             }
@@ -1749,8 +2412,8 @@ mod tests {
                 state.navigation.routes.clear();
                 for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     for dy in -1..=1 {
-                        let to = state.position.cell().offset(dx, dy, dz);
-                        let blocks: Vec<_> = crate::world::clearance(state.position.cell(), to)
+                        let to = state.feet().offset(dx, dy, dz);
+                        let blocks: Vec<_> = crate::world::clearance(state.feet(), to)
                             .into_iter()
                             .filter_map(|p| {
                                 world.get(p).map(|b| LocalBlock {
@@ -1773,23 +2436,47 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            (calls, stored, resumed, state.position.cell())
+            (calls, stored, resumed, state.feet())
         });
         let mut bridge = Bridge::new(root.clone(), root.join("runtime")).expect("bridge");
         bridge.remaining = Some(60);
         bridge.deadline = Some(Instant::now() + Duration::from_secs(12));
-        let result = run(&mut bridge);
+        let mode = match case {
+            HomeCase::CancelHere | HomeCase::RejectCancel => StartMode::MineHere,
+            HomeCase::CancelWaypoint => StartMode::MineWaypoint,
+            _ => StartMode::Resume,
+        };
+        let result = run(&mut bridge, mode);
         shutdown.store(true, Ordering::Relaxed);
         let (calls, stored, resumed, last) = worker.join().expect("worker");
-        assert!(stored, "store not reached: {case:?} {calls:?} {result:?}");
-        if case == HomeCase::EmptyChest {
+        if case == HomeCase::RejectCancel {
+            assert!(result.is_ok(), "cancellation failure pauses: {result:?}");
+            assert_eq!(calls, ["home_ack", "stop"]);
+            assert!(bridge.runtime.join("resume-mine.json").exists());
+        } else if case == HomeCase::CancelWaypoint {
+            assert!(!stored, "explicit mine must bypass old storage trip");
+            assert!(resumed, "must reach mine and mine: {calls:?} {result:?}");
+            assert!(!bridge.runtime.join("resume-mine.json").exists());
+        } else if case == HomeCase::EmptyChest {
+            assert!(stored, "must try chest before supply pause");
             assert!(result.is_ok(), "resource pause: {result:?}");
             assert!(!resumed);
             assert!(last.distance(home) <= 2.);
             assert!(!calls.iter().any(|c| c == "mine"));
         } else {
+            assert!(stored, "store not reached: {case:?} {calls:?} {result:?}");
             assert!(resumed, "must mine again: {case:?} {calls:?} {result:?}");
             assert!(calls.iter().any(|c| c == "home_ack"));
+            assert_eq!(
+                calls.iter().filter(|c| *c == "store").count(),
+                1,
+                "must not loop back to storage"
+            );
+            if case == HomeCase::CancelHere {
+                assert_eq!(calls.first().map(String::as_str), Some("home_ack"));
+                assert_eq!(calls.iter().filter(|c| *c == "home_ack").count(), 2);
+                assert!(!bridge.runtime.join("resume-mine.json").exists());
+            }
         }
         assert_eq!(calls.last().map(String::as_str), Some("stop"));
         fs::remove_dir_all(root).expect("cleanup");
@@ -1804,6 +2491,7 @@ mod tests {
         let directory = root.join("config/flyminer");
         fs::create_dir_all(&directory).expect("mkdir");
         let (mut world, mut state) = crate::planner::tests::fixture();
+        state.capabilities = vec!["hazard_recovery".into(), "rear_torches".into()];
         state.enabled = true;
         state.expected_session = true;
         state.on_ground = true;
@@ -1841,6 +2529,34 @@ mod tests {
             },
         ];
         state.held_item = "pick".into();
+        if scenario == Scenario::Dwarf {
+            state.mining_profile.name = "dwarf".into();
+            state.mining_profile.can_swim = false;
+            state.mining_profile.requires_cover = true;
+            state.mining_profile.under_cover = false;
+        }
+        if scenario == Scenario::BlockTools {
+            state.capabilities.push("block_tools".into());
+            state.held_item = "minecraft:iron_shovel".into();
+        }
+        if scenario == Scenario::Oxygen {
+            state.oxygen.needs_escape = true;
+            state.oxygen.air = 100;
+            state.capabilities.push("oxygen_escape".into());
+        }
+        if scenario == Scenario::NetherThreat {
+            state.dimension = crate::nether::DIMENSION.into();
+            world.scan.dimension = state.dimension.clone();
+            state.capabilities.push("nether_mining".into());
+            state.capabilities.push("fractional_floor".into());
+            state.hostiles.push(Enemy {
+                kind: "minecraft:ghast".into(),
+                ranged: true,
+                visible: true,
+                distance: 18.,
+                ..Default::default()
+            });
+        }
         if scenario == Scenario::Craft {
             state.inventory.retain(|s| !s.pickaxe);
             state.free_slots = 3;
@@ -1853,6 +2569,19 @@ mod tests {
         state.updated_at = now();
         state.health = initial_health;
         state.food = initial_food;
+        if matches!(scenario, Scenario::LiquidBuffer | Scenario::LiquidCombat) {
+            state.liquid_safe = Some(false);
+        }
+        if scenario == Scenario::LiquidCombat {
+            state.hostiles.push(Enemy {
+                id: 1,
+                uuid: "mob".into(),
+                visible: true,
+                distance: 2.,
+                health: 10.,
+                ..Default::default()
+            });
+        }
         if scenario == Scenario::Edge {
             state.position.x = 3.8;
             state.navigation.origin_safe = false;
@@ -1883,7 +2612,7 @@ mod tests {
                 ..LocalBlock::default()
             });
         }
-        if scenario == Scenario::Focus {
+        if matches!(scenario, Scenario::Focus | Scenario::BlockedFocus) {
             let member = Pos { x: 6, y: 1, z: 3 };
             let i = world.index(member).expect("vein member");
             world.scan.cells[i] = 2;
@@ -1911,10 +2640,21 @@ mod tests {
         atomic_json(&directory.join("state.json"), &state).expect("state");
         let shutdown = Arc::new(AtomicBool::new(false));
         let finished = shutdown.clone();
+        let scoreboard = root.join("runtime/scoreboard.json");
         let worker = thread::spawn(move || {
             let mut calls = Vec::<String>::new();
             let mut mined = 0;
+            let mut saw_shelter = false;
             while !finished.load(Ordering::Relaxed) {
+                if scenario == Scenario::Dwarf
+                    && !saw_shelter
+                    && let Ok(bytes) = fs::read(&scoreboard)
+                    && let Ok(board) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && board["mode"] == "shelter"
+                {
+                    saw_shelter = true;
+                    state.mining_profile.under_cover = true;
+                }
                 if let Ok(bytes) = fs::read(directory.join("command.json")) {
                     let command: serde_json::Value =
                         serde_json::from_slice(&bytes).expect("command");
@@ -1922,6 +2662,10 @@ mod tests {
                     let name = command["action"].as_str().expect("action");
                     calls.push(name.to_string());
                     if matches!(name, "mine" | "traverse" | "scan") {
+                        assert!(
+                            state.mining_profile.under_cover,
+                            "Work must wait for shelter"
+                        );
                         assert!(
                             state.health >= 18.,
                             "Cannot {name} before HP recovers: {}",
@@ -1933,7 +2677,20 @@ mod tests {
                         );
                     }
                     let id = command["id"].as_str().expect("id").to_string();
+                    let mut result_status = "done";
                     match name {
+                        "breathe" => {
+                            state.oxygen.needs_escape = false;
+                            state.oxygen.air = 300;
+                            state.oxygen.breathable = true;
+                        }
+                        "escape" => {
+                            state.liquid_safe = Some(true);
+                            if scenario == Scenario::NetherThreat {
+                                assert_eq!(command["avoidThreats"], true);
+                                state.hostiles.clear();
+                            }
+                        }
                         "center" => {
                             state.position.x = 4.5;
                             state.position.z = 3.5;
@@ -1974,13 +2731,19 @@ mod tests {
                             }
                             state.navigation.ores.retain(|b| b.pos != pos);
                             // No inventory gains: an ore break must not terminate the loop.
-                            if scenario == Scenario::Focus && mined <= 2 {
+                            if matches!(scenario, Scenario::Focus | Scenario::BlockedFocus)
+                                && mined <= 2
+                            {
                                 assert_eq!(
                                     pos,
-                                    Pos {
-                                        x: if mined == 1 { 5 } else { 6 },
-                                        y: 1,
-                                        z: 3
+                                    if scenario == Scenario::BlockedFocus && mined == 2 {
+                                        Pos { x: 3, y: 1, z: 5 }
+                                    } else {
+                                        Pos {
+                                            x: if mined == 1 { 5 } else { 6 },
+                                            y: 1,
+                                            z: 3,
+                                        }
                                     },
                                     "Must finish committed vein even after another becomes cheaper/closer"
                                 );
@@ -1989,6 +2752,16 @@ mod tests {
                                     if b.pos == (Pos { x: 3, y: 1, z: 5 }) {
                                         b.kind.seconds = 0.01;
                                     }
+                                }
+                                if scenario == Scenario::BlockedFocus && mined == 1 {
+                                    let blocked = Pos { x: 6, y: 1, z: 3 };
+                                    world.scan.palette.push(crate::types::Block {
+                                        diggable: false,
+                                        ..world.scan.palette[2].clone()
+                                    });
+                                    let i = world.index(blocked).expect("blocked ore");
+                                    world.scan.cells[i] = world.scan.palette.len() - 1;
+                                    state.navigation.ores.retain(|b| b.pos != blocked);
                                 }
                             }
                             if mined == 1 && scenario == Scenario::FullAfterOre {
@@ -2021,14 +2794,24 @@ mod tests {
                             state.held_item = "food".into();
                         }
                         "torch" => {
-                            state.light_level = 14;
+                            assert!(
+                                command["forwardX"].as_i64().expect("heading x").abs()
+                                    + command["forwardZ"].as_i64().expect("heading z").abs()
+                                    == 1
+                            );
+                            assert!(command["avoid"].is_array());
+                            if scenario == Scenario::TorchSkipped {
+                                result_status = "skipped";
+                            } else {
+                                state.light_level = 14;
+                            }
                             state.held_item = "torch".into();
                         }
                         _ => {}
                     }
                     state.last_result = Outcome {
                         id,
-                        status: "done".into(),
+                        status: result_status.into(),
                         message: String::new(),
                     };
                 }
@@ -2039,14 +2822,72 @@ mod tests {
                 atomic_json(&directory.join("state.json"), &state).expect("state update");
                 thread::sleep(Duration::from_millis(10));
             }
+            if scenario == Scenario::Dwarf {
+                assert!(saw_shelter, "Must wait for shelter before resuming");
+            }
             calls
         });
         let mut bridge = Bridge::new(root.clone(), root.join("runtime")).expect("bridge");
-        bridge.remaining = Some(12);
+        bridge.remaining = Some(
+            if matches!(
+                scenario,
+                Scenario::BlockedFocus
+                    | Scenario::LiquidBuffer
+                    | Scenario::LiquidCombat
+                    | Scenario::TorchSkipped
+            ) {
+                20
+            } else {
+                12
+            },
+        );
         bridge.deadline = Some(Instant::now() + Duration::from_secs(8));
-        let result = run(&mut bridge);
+        let result = run(&mut bridge, StartMode::Resume);
         shutdown.store(true, Ordering::Relaxed);
         let calls = worker.join().expect("worker");
+        if scenario == Scenario::Dwarf {
+            assert_eq!(calls.first().map(String::as_str), Some("eat"));
+        }
+        if scenario == Scenario::BlockTools {
+            assert!(
+                !calls.iter().any(|c| c == "equip"),
+                "Rust must not force a pickaxe between per-block tool choices: {calls:?}"
+            );
+        }
+        if scenario == Scenario::Oxygen {
+            assert_eq!(calls.first().map(String::as_str), Some("breathe"));
+            assert!(
+                calls.iter().any(|c| c == "mine"),
+                "Mining must resume after oxygen recovery"
+            );
+        }
+        if scenario == Scenario::NetherThreat {
+            assert_eq!(calls.first().map(String::as_str), Some("escape"));
+            assert!(
+                calls
+                    .iter()
+                    .position(|c| c == "torch")
+                    .expect("bright Nether torch")
+                    < calls.iter().position(|c| c == "mine").expect("mining")
+            );
+        }
+        if scenario == Scenario::LiquidBuffer {
+            assert_eq!(calls.first().map(String::as_str), Some("escape"));
+        }
+        if scenario == Scenario::LiquidCombat {
+            assert_eq!(calls.first().map(String::as_str), Some("attack"));
+            assert!(
+                calls.iter().position(|c| c == "escape").expect("retreat")
+                    < calls.iter().position(|c| c == "mine").expect("mine")
+            );
+        }
+        if scenario == Scenario::TorchSkipped {
+            assert_eq!(
+                calls.iter().filter(|c| *c == "torch").count(),
+                1,
+                "skip must back off"
+            );
+        }
         if scenario == Scenario::Craft {
             assert!(
                 calls
